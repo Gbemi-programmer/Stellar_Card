@@ -107,11 +107,6 @@
 
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
-    Symbol, Vec,
-
-#![no_std]
-use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
     BytesN, Env, String, Symbol, Vec,
 };
@@ -170,21 +165,10 @@ pub enum DataKey {
     Treasury,
     /// Address of the USDC Stellar Asset Contract (SAC). Set once by `init`.
     UsdcContract,
-    /// Address of the native XLM Stellar Asset Contract (SAC). Set once by
-    /// `init`.
+    /// Address of the native XLM Stellar Asset Contract (SAC). Set once by `init`.
     XlmContract,
     /// Address of the contract administrator. Set by `init`, moved by
     /// `transfer_admin`, and always treated as holding `Role::Admin`.
-/// Each variant identifies a slot in the contract's instance storage.
-#[contracttype]
-pub enum DataKey {
-    /// Address that receives forwarded payments.
-    Treasury,
-    /// Address of the USDC Stellar Asset Contract (SAC).
-    UsdcContract,
-    /// Address of the native XLM Stellar Asset Contract (SAC).
-    XlmContract,
-    /// Address of the contract administrator.
     Admin,
     /// Per-address role assignment. Replaces a single `Roles: Map<Address, Role>`
     /// instance-storage entry: a Map entry grows (and gets re-serialized +
@@ -200,9 +184,6 @@ pub enum DataKey {
     /// payments. Only stored while paused — an absent key means unpaused
     /// (Issue #395 - Part 2), so the common unpaused state costs no bytes in
     /// the instance entry every call loads.
-    /// Boolean flag marking whether a guarded operation is currently in progress.
-    ReentrancyGuard,
-    /// Circuit breaker: when true, `pay_usdc`/`pay_xlm` refuse new payments.
     Paused,
     /// Maximum amount `rescue_tokens` may move in a single call. Key
     /// absent means no per-call cap is configured.
@@ -227,18 +208,6 @@ pub enum DataKey {
 ///
 /// The discriminants are part of the contract's public ABI — clients match on
 /// the numeric code — so existing values must never be renumbered.
-    /// `(day, total)`: the running total withdrawn via `rescue_tokens`
-    /// during `day` (ledger timestamp / 86400). A total recorded for any
-    /// earlier day reads as 0, so the accumulator resets at each day
-    /// boundary without an explicit reset call.
-    ///
-    /// Issue #391 (Part 1): this used to be `WithdrawnToday(u64)`, one key
-    /// per day that was never removed. Instance storage is loaded and
-    /// rent-extended as a single entry on every call, so each day with a
-    /// rescue permanently grew the cost of every later payment. One
-    /// overwritten slot keeps that footprint constant.
-    WithdrawnToday,
-}
 
 /// Contract errors
 #[contracterror]
@@ -689,13 +658,6 @@ impl Stellar_CardReceiver {
     /// # Panics
     /// Panics if called before `init`, if `from.require_auth()` fails, or
     /// with "reentrancy detected" if invoked from inside another guarded call.
-    /// # Testing (Issue #423 - Part 5)
-    /// Comprehensive unit tests cover all error paths, authorization checks,
-    /// reentrancy protection, pausing behavior, and successful transfers with
-    /// various amounts and order IDs. See tests starting at line ~957.
-    ///
-    /// # Events
-    /// Emits: topics=[Symbol("pay_usdc"), order_id, from], value=amount
     pub fn pay_usdc(env: Env, from: Address, amount: i128, order_id: Bytes) -> Result<(), Error> {
         if Self::is_paused(&env) {
             return Err(Error::ContractPaused);
@@ -757,8 +719,6 @@ impl Stellar_CardReceiver {
     /// # Panics
     /// Panics if called before `init`, if `from.require_auth()` fails, or
     /// with "reentrancy detected" if invoked from inside another guarded call.
-    /// # Events
-    /// Emits: topics=[Symbol("pay_xlm"), order_id, from], value=amount
     pub fn pay_xlm(env: Env, from: Address, amount: i128, order_id: Bytes) -> Result<(), Error> {
         if Self::is_paused(&env) {
             return Err(Error::ContractPaused);
@@ -806,8 +766,6 @@ impl Stellar_CardReceiver {
     }
 
     /// Returns the USDC SAC contract address.
-
-    /// Returns the USDC SAC contract address.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
@@ -830,31 +788,6 @@ impl Stellar_CardReceiver {
     /// * `env` - The Soroban environment
     ///
     /// # Returns
-    /// The USDC contract address
-    ///
-    /// # Panics
-    /// Panics if called before `init` (see `try_usdc_contract` to avoid this).
-    pub fn usdc_contract(env: Env) -> Address {
-        env.storage()
-            .instance()
-            .get(&DataKey::UsdcContract)
-            .unwrap()
-    }
-
-    /// Returns the native XLM SAC contract address.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    ///
-    /// # Returns
-    /// The XLM contract address
-    ///
-    /// # Panics
-    /// Panics if called before `init` (see `try_xlm_contract` to avoid this).
-    pub fn xlm_contract(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::XlmContract).unwrap()
-    }
-
     /// The XLM contract address
     ///
     /// # Panics
@@ -928,9 +861,6 @@ impl Stellar_CardReceiver {
     /// * `amount` - Amount to recover, in the token's base units
     ///
     /// # Authorization
-    /// Requires `caller` to hold the `Admin` role (the stored admin always
-    /// qualifies, see `has_authority`) — recovering funds is powerful enough
-    /// that it stays Admin-only, unlike `pause`.
     /// Requires `caller` to either be the stored `DataKey::Admin` address,
     /// or hold the `Admin` role via `grant_role` — recovering funds is
     /// powerful enough that it stays Admin-only, unlike `pause` (see
@@ -973,7 +903,6 @@ impl Stellar_CardReceiver {
         amount: i128,
     ) -> Result<(), Error> {
         caller.require_auth();
-        if !Self::has_authority(&env, &caller, Role::Admin) {
         if !Self::has_admin_authority(&env, &caller) {
             panic!("rescue_tokens requires the Admin role");
         }
@@ -999,7 +928,6 @@ impl Stellar_CardReceiver {
             }
         }
 
-        let day = env.ledger().timestamp() / 86_400;
         let day = Self::current_day(&env);
         let withdrawn_today = Self::withdrawn_on(&env, day);
         let new_total = withdrawn_today.saturating_add(amount);
@@ -1022,9 +950,6 @@ impl Stellar_CardReceiver {
         // transfer can never observe a stale total and slip a second
         // withdrawal under the daily limit.
         Self::set_withdrawn(&env, day, new_total);
-        env.storage()
-            .instance()
-            .set(&DataKey::WithdrawnToday, &(day, new_total));
 
         let transferred = Self::with_reentrancy_guard(&env, || {
             token::Client::new(&env, &token_contract)
@@ -1035,9 +960,6 @@ impl Stellar_CardReceiver {
             // The transfer didn't happen, so it mustn't count against the
             // day's budget: restore the accumulator to its previous value.
             Self::set_withdrawn(&env, day, withdrawn_today);
-            env.storage()
-                .instance()
-                .set(&DataKey::WithdrawnToday, &(day, withdrawn_today));
             return Err(Error::TransferFailed);
         }
 
@@ -1075,9 +997,6 @@ impl Stellar_CardReceiver {
     /// value=(per_call, per_day)
     ///
     /// # Panics
-    /// Panics if `caller` does not hold the `Admin` role (the stored admin
-    /// always qualifies), if `caller.require_auth()` fails, or if either
-    /// limit is provided as <= 0.
     /// Panics if `caller` does not hold the `Admin` role (or is not the
     /// stored admin), if `caller.require_auth()` fails, if either limit
     /// is provided as <= 0, or if both are set and `per_call` exceeds
@@ -1089,7 +1008,6 @@ impl Stellar_CardReceiver {
         per_day: Option<i128>,
     ) {
         caller.require_auth();
-        if !Self::has_authority(&env, &caller, Role::Admin) {
         if !Self::has_admin_authority(&env, &caller) {
             panic!("set_withdraw_limits requires the Admin role");
         }
@@ -1178,7 +1096,7 @@ impl Stellar_CardReceiver {
         env.ledger().timestamp() / 86_400
     }
 
-    /// Total recorded against `day` in [`DataKey::WithdrawnToday`]; 0 when
+    /// Total recorded against `day` in [`DataKey::DailyWithdrawn`]; 0 when
     /// nothing has been withdrawn yet or the stored total is for an
     /// earlier day.
     fn withdrawn_on(env: &Env, day: u64) -> i128 {
@@ -1186,7 +1104,6 @@ impl Stellar_CardReceiver {
             .storage()
             .instance()
             .get::<_, (u64, i128)>(&DataKey::DailyWithdrawn)
-            .get::<_, (u64, i128)>(&DataKey::WithdrawnToday)
         {
             Some((stored_day, total)) if stored_day == day => total,
             _ => 0,
@@ -1238,8 +1155,6 @@ impl Stellar_CardReceiver {
     /// Emits `role_revoked` for the old admin (if it held `Admin`),
     /// `role_granted` for `new_admin` (if its role changed), then
     /// topics=[Symbol("admin_transferred"), old_admin, new_admin], value=()
-    /// # Events (Issue #428 - Part 5)
-    /// Emits: topics=[Symbol("admin_transferred"), old_admin, new_admin], value=()
     ///
     /// # Security
     /// Two-step authorization prevents accidental admin lockout from typos or
@@ -1492,31 +1407,6 @@ impl Stellar_CardReceiver {
         }
     }
 
-    }
-
-    /// Checks if an address has at least the specified role or higher.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `address` - The address to check
-    /// * `required_role` - The minimum required role
-    ///
-    /// # Returns
-    /// `true` if the address has the required role or higher in hierarchy, `false` otherwise
-    ///
-    /// # Hierarchy
-    /// Admin > Operator > Viewer
-    pub fn has_role(env: Env, address: Address, required_role: Role) -> bool {
-        match env
-            .storage()
-            .persistent()
-            .get::<_, Role>(&DataKey::UserRole(address))
-        {
-            Some(user_role) => Self::is_role_sufficient(&user_role, &required_role),
-            None => false,
-        }
-    }
-
     /// Checks whether a user role satisfies a required role level.
     ///
     /// # Arguments
@@ -1562,13 +1452,6 @@ impl Stellar_CardReceiver {
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         *caller == stored_admin || Self::has_role(env.clone(), caller.clone(), required)
     }
-        match (user_role, required_role) {
-            (Role::Admin, _) => true,
-            (Role::Operator, Role::Operator) | (Role::Operator, Role::Viewer) => true,
-            (Role::Viewer, Role::Viewer) => true,
-            _ => false,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1577,14 +1460,7 @@ mod test {
 
     use super::*;
     use soroban_sdk::{
-        testutils::{
-            Address as _, AuthorizedFunction, AuthorizedInvocation, Events, IssuerFlags,
-            Ledger as _, MockAuth, MockAuthInvoke,
-    use super::*;
-    use soroban_sdk::{
-        testutils::{
-            storage::Instance as _, Address as _, Events, Ledger as _, MockAuth, MockAuthInvoke,
-        },
+        testutils::{Address as _, Events, Ledger as _, MockAuth, MockAuthInvoke},
         token, Bytes, Env, IntoVal, Symbol, TryIntoVal,
     };
 
