@@ -29,6 +29,18 @@
 //!   own address is `rescue_tokens`, which recovers tokens sent to it by
 //!   mistake and is capped by the optional per-call / per-day limits set with
 //!   `set_withdraw_limits`.
+//! * **No custody of payments** — `pay_usdc`/`pay_xlm` forward funds
+//!   directly from payer to `DataKey::Treasury` in the same call, so the
+//!   contract never holds payment funds itself.
+//! * **Administrative withdraw limits (issues #401, #391)** — the only way
+//!   to move tokens out of the contract is `rescue_tokens`, which recovers
+//!   tokens sent to the contract by mistake. It is Admin-gated and bounded
+//!   by optional per-call and per-day limits (`set_withdraw_limits`), whose
+//!   progress is visible through `withdrawn_today`. Limits must be positive
+//!   and the per-call limit can't exceed the daily one; rescuing to the
+//!   contract itself is rejected so it can't burn the day's budget; and the
+//!   daily total lives in a single storage slot, keeping the instance
+//!   entry's size constant however many days see a rescue.
 //!
 //! ## Events
 //! Every entrypoint that changes contract state emits exactly one event per
@@ -97,6 +109,11 @@
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
     Symbol, Vec,
+
+#![no_std]
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
+    BytesN, Env, String, Symbol, Vec,
 };
 
 /// Instance storage is extended to this many ledgers (~1000 days at 5s
@@ -119,6 +136,11 @@ const INSTANCE_TTL_THRESHOLD: u32 = INSTANCE_TTL_MAX / 2;
 /// SACs this contract is built for — uses 7, and `pay_usdc`/`pay_xlm`
 /// document their `amount` in 7-decimal base units.
 const TOKEN_DECIMALS: u32 = 7;
+
+/// `name()` reported by the native XLM Stellar Asset Contract. Issued
+/// assets' SACs report `"CODE:ISSUER"` instead, so this identifies the
+/// native asset unambiguously (Issue #389 - Part 1).
+const NATIVE_ASSET_NAME: &str = "native";
 
 /// Represents user roles in the contract with hierarchical permissions.
 ///
@@ -153,6 +175,16 @@ pub enum DataKey {
     XlmContract,
     /// Address of the contract administrator. Set by `init`, moved by
     /// `transfer_admin`, and always treated as holding `Role::Admin`.
+/// Each variant identifies a slot in the contract's instance storage.
+#[contracttype]
+pub enum DataKey {
+    /// Address that receives forwarded payments.
+    Treasury,
+    /// Address of the USDC Stellar Asset Contract (SAC).
+    UsdcContract,
+    /// Address of the native XLM Stellar Asset Contract (SAC).
+    XlmContract,
+    /// Address of the contract administrator.
     Admin,
     /// Per-address role assignment. Replaces a single `Roles: Map<Address, Role>`
     /// instance-storage entry: a Map entry grows (and gets re-serialized +
@@ -168,6 +200,9 @@ pub enum DataKey {
     /// payments. Only stored while paused — an absent key means unpaused
     /// (Issue #395 - Part 2), so the common unpaused state costs no bytes in
     /// the instance entry every call loads.
+    /// Boolean flag marking whether a guarded operation is currently in progress.
+    ReentrancyGuard,
+    /// Circuit breaker: when true, `pay_usdc`/`pay_xlm` refuse new payments.
     Paused,
     /// Maximum amount `rescue_tokens` may move in a single call. Key
     /// absent means no per-call cap is configured.
@@ -192,6 +227,20 @@ pub enum DataKey {
 ///
 /// The discriminants are part of the contract's public ABI — clients match on
 /// the numeric code — so existing values must never be renumbered.
+    /// `(day, total)`: the running total withdrawn via `rescue_tokens`
+    /// during `day` (ledger timestamp / 86400). A total recorded for any
+    /// earlier day reads as 0, so the accumulator resets at each day
+    /// boundary without an explicit reset call.
+    ///
+    /// Issue #391 (Part 1): this used to be `WithdrawnToday(u64)`, one key
+    /// per day that was never removed. Instance storage is loaded and
+    /// rent-extended as a single entry on every call, so each day with a
+    /// rescue permanently grew the cost of every later payment. One
+    /// overwritten slot keeps that footprint constant.
+    WithdrawnToday,
+}
+
+/// Contract errors
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -207,12 +256,17 @@ pub enum Error {
     /// `rescue_tokens` amount would push today's cumulative withdrawals past
     /// the configured daily withdraw limit
     DailyWithdrawLimitExceeded = 5,
+    /// `rescue_tokens` recipient is the contract itself, which would move
+    /// nothing while still spending the day's withdraw budget
+    InvalidRecipient = 6,
 }
 
 /// The stellar_card card receiver contract.
 ///
 /// Holds no in-memory state; all data lives in contract storage keyed by
 /// [`DataKey`]. All contract entrypoints are implemented on this type.
+/// Holds no in-memory state; all persistent data lives in instance storage keyed
+/// by [`DataKey`]. All contract entrypoints are implemented on this type.
 #[contract]
 pub struct Stellar_CardReceiver;
 
@@ -232,7 +286,9 @@ impl Stellar_CardReceiver {
     /// is written (Issue #399 - Part 2): the receiver contract can't be used
     /// for any role; the admin can't be the treasury or a token contract;
     /// the token contracts must differ and not double as the treasury; and
-    /// both must implement the token interface with 7 decimals.
+    /// both must implement the token interface with 7 decimals; and the
+    /// native XLM asset can't be passed as `usdc_contract` (Issue #389 -
+    /// Part 1), which would mean the two token arguments are swapped.
     ///
     /// # Storage
     /// Writes the four configuration addresses to instance storage and grants
@@ -245,6 +301,7 @@ impl Stellar_CardReceiver {
     /// # Panics
     /// Panics if already initialized, if admin authorization fails, or if any
     /// validation check fails (see `validate_init_params`).
+    /// validation check fails.
     ///
     /// # Notes
     /// One-time initialization. The admin must authorize to prevent front-running on deployment.
@@ -277,6 +334,7 @@ impl Stellar_CardReceiver {
             .set(&DataKey::XlmContract, &xlm_contract);
         // `DataKey::Paused` is deliberately not written: an absent key reads
         // as unpaused (Issue #395 - Part 2).
+        env.storage().instance().set(&DataKey::Paused, &false);
 
         // Grant the Admin role to the admin address itself. Without this,
         // the deploying admin (the DataKey::Admin address) would satisfy
@@ -294,6 +352,7 @@ impl Stellar_CardReceiver {
         // Emit initialization event (Issue #428 - Part 5)
         env.events().publish(
             (Symbol::new(&env, "init"), admin.clone()),
+            (symbol_short!("init"), admin.clone()),
             (
                 treasury.clone(),
                 usdc_contract.clone(),
@@ -321,6 +380,9 @@ impl Stellar_CardReceiver {
     ///   and report [`TOKEN_DECIMALS`], the precision `pay_usdc`/`pay_xlm`
     ///   amounts are documented in. A token with any other precision would
     ///   silently mis-scale every payment by a power of ten.
+    /// * `usdc_contract` must not be the native XLM asset contract (Issue
+    ///   #389 - Part 1), which catches the USDC/XLM arguments being passed
+    ///   in swapped order.
     ///
     /// # Panics
     /// Panics with a message naming the offending parameter on the first
@@ -382,6 +444,26 @@ impl Stellar_CardReceiver {
             Ok(Ok(_)) => panic!("xlm_contract must use 7 decimals"),
             _ => panic!("xlm_contract does not implement the token interface"),
         }
+
+        // Issue #389 (Part 1): the decimals probe can't tell USDC and XLM
+        // apart — both SACs report 7 — so swapping the two arguments would
+        // pass every check above and silently route every `pay_usdc` through
+        // native XLM. The native asset's SAC is the only one whose `name()`
+        // is "native" (issued assets report "CODE:ISSUER"), so it identifies
+        // the swap exactly. `name()` is only consulted, not required: the
+        // decimals probe above is what establishes the token interface.
+        if Self::is_native_asset(env, usdc_contract) {
+            panic!("usdc_contract cannot be the native XLM asset contract");
+        }
+    }
+
+    /// Returns whether `token_contract` is the native XLM Stellar Asset
+    /// Contract, i.e. answers `name()` with `NATIVE_ASSET_NAME`.
+    fn is_native_asset(env: &Env, token_contract: &Address) -> bool {
+        matches!(
+            token::Client::new(env, token_contract).try_name(),
+            Ok(Ok(name)) if name == String::from_str(env, NATIVE_ASSET_NAME)
+        )
     }
 
     /// Acquires the reentrancy guard to prevent reentrant calls.
@@ -435,6 +517,11 @@ impl Stellar_CardReceiver {
     /// Removes the entry instead of writing `false`, so no temporary entry
     /// (and no rent for one) is left behind after the call. `_enter` already
     /// treats an absent key as "not held".
+    ///
+    /// # Security (Issue #427 - Part 5)
+    /// Must be called in every exit path from a guarded function (success,
+    /// error, or panic recovery via Drop) to ensure the guard doesn't remain
+    /// locked if an early return occurs.
     fn _exit(env: &Env) {
         env.storage().temporary().remove(&DataKey::ReentrancyGuard);
     }
@@ -503,7 +590,7 @@ impl Stellar_CardReceiver {
 
         // Emit pause event (Issue #428 - Part 5)
         env.events()
-            .publish((Symbol::new(&env, "paused"), caller), true);
+            .publish((symbol_short!("paused"), caller), true);
     }
 
     /// Unpauses the contract, re-enabling token transfers.
@@ -537,7 +624,7 @@ impl Stellar_CardReceiver {
 
         // Emit unpause event (Issue #428 - Part 5)
         env.events()
-            .publish((Symbol::new(&env, "unpaused"), admin), false);
+            .publish((symbol_short!("unpaused"), admin), false);
     }
 
     /// Extends instance storage's TTL, but only performs the (fee-costing)
@@ -576,6 +663,13 @@ impl Stellar_CardReceiver {
     /// * `amount` - Amount in micro-USDC (7 decimal places)
     /// * `order_id` - Order identifier for event tracking
     ///
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `from` - The payer address (must authorize this transfer)
+    /// * `amount` - Amount in micro-USDC (7 decimal places)
+    /// * `order_id` - Order identifier for event tracking
+    ///
     /// # Returns
     /// `Ok(())` on successful transfer, `Err(Error)` otherwise.
     ///
@@ -595,6 +689,13 @@ impl Stellar_CardReceiver {
     /// # Panics
     /// Panics if called before `init`, if `from.require_auth()` fails, or
     /// with "reentrancy detected" if invoked from inside another guarded call.
+    /// # Testing (Issue #423 - Part 5)
+    /// Comprehensive unit tests cover all error paths, authorization checks,
+    /// reentrancy protection, pausing behavior, and successful transfers with
+    /// various amounts and order IDs. See tests starting at line ~957.
+    ///
+    /// # Events
+    /// Emits: topics=[Symbol("pay_usdc"), order_id, from], value=amount
     pub fn pay_usdc(env: Env, from: Address, amount: i128, order_id: Bytes) -> Result<(), Error> {
         if Self::is_paused(&env) {
             return Err(Error::ContractPaused);
@@ -623,7 +724,7 @@ impl Stellar_CardReceiver {
         }
 
         env.events()
-            .publish((Symbol::new(&env, "pay_usdc"), order_id, from), amount);
+            .publish((symbol_short!("pay_usdc"), order_id, from), amount);
 
         Self::extend_instance_ttl(&env);
         Ok(())
@@ -656,6 +757,8 @@ impl Stellar_CardReceiver {
     /// # Panics
     /// Panics if called before `init`, if `from.require_auth()` fails, or
     /// with "reentrancy detected" if invoked from inside another guarded call.
+    /// # Events
+    /// Emits: topics=[Symbol("pay_xlm"), order_id, from], value=amount
     pub fn pay_xlm(env: Env, from: Address, amount: i128, order_id: Bytes) -> Result<(), Error> {
         if Self::is_paused(&env) {
             return Err(Error::ContractPaused);
@@ -680,7 +783,7 @@ impl Stellar_CardReceiver {
         }
 
         env.events()
-            .publish((Symbol::new(&env, "pay_xlm"), order_id, from), amount);
+            .publish((symbol_short!("pay_xlm"), order_id, from), amount);
 
         Self::extend_instance_ttl(&env);
         Ok(())
@@ -701,6 +804,8 @@ impl Stellar_CardReceiver {
     pub fn treasury(env: Env) -> Address {
         env.storage().instance().get(&DataKey::Treasury).unwrap()
     }
+
+    /// Returns the USDC SAC contract address.
 
     /// Returns the USDC SAC contract address.
     ///
@@ -725,6 +830,31 @@ impl Stellar_CardReceiver {
     /// * `env` - The Soroban environment
     ///
     /// # Returns
+    /// The USDC contract address
+    ///
+    /// # Panics
+    /// Panics if called before `init` (see `try_usdc_contract` to avoid this).
+    pub fn usdc_contract(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::UsdcContract)
+            .unwrap()
+    }
+
+    /// Returns the native XLM SAC contract address.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// The XLM contract address
+    ///
+    /// # Panics
+    /// Panics if called before `init` (see `try_xlm_contract` to avoid this).
+    pub fn xlm_contract(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::XlmContract).unwrap()
+    }
+
     /// The XLM contract address
     ///
     /// # Panics
@@ -780,7 +910,7 @@ impl Stellar_CardReceiver {
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
         env.events()
-            .publish((Symbol::new(&env, "upgraded"), admin), new_wasm_hash);
+            .publish((symbol_short!("upgraded"), admin), new_wasm_hash);
     }
 
     /// Recovers tokens sent to the contract by mistake — a direct transfer
@@ -801,9 +931,19 @@ impl Stellar_CardReceiver {
     /// Requires `caller` to hold the `Admin` role (the stored admin always
     /// qualifies, see `has_authority`) — recovering funds is powerful enough
     /// that it stays Admin-only, unlike `pause`.
+    /// Requires `caller` to either be the stored `DataKey::Admin` address,
+    /// or hold the `Admin` role via `grant_role` — recovering funds is
+    /// powerful enough that it stays Admin-only, unlike `pause` (see
+    /// `Stellar_CardReceiver::pause`'s doc comment for the contrast). Both
+    /// forms are accepted because the deploying admin is never
+    /// auto-granted the `Admin` role (`grant_role`/`has_role` are a
+    /// separate system from `DataKey::Admin`) — requiring only the role
+    /// would lock out a fresh deployment until someone remembered to grant
+    /// it to themselves.
     ///
     /// # Errors
     /// * `InvalidAmount` - If `amount` is <= 0
+    /// * `InvalidRecipient` - If `to` is the contract itself
     /// * `WithdrawLimitExceeded` - If a per-call limit is configured and
     ///   `amount` exceeds it
     /// * `DailyWithdrawLimitExceeded` - If a daily limit is configured and
@@ -834,10 +974,19 @@ impl Stellar_CardReceiver {
     ) -> Result<(), Error> {
         caller.require_auth();
         if !Self::has_authority(&env, &caller, Role::Admin) {
+        if !Self::has_admin_authority(&env, &caller) {
             panic!("rescue_tokens requires the Admin role");
         }
         if amount <= 0 {
             return Err(Error::InvalidAmount);
+        }
+        // Issue #391 (Part 1): a self-transfer leaves the balance where it
+        // is but would still be counted against the daily limit, letting a
+        // mistaken (or compromised) caller exhaust the day's budget and
+        // block a genuine rescue.
+        let contract_address = env.current_contract_address();
+        if to == contract_address {
+            return Err(Error::InvalidRecipient);
         }
 
         if let Some(per_call_limit) = env
@@ -851,6 +1000,7 @@ impl Stellar_CardReceiver {
         }
 
         let day = env.ledger().timestamp() / 86_400;
+        let day = Self::current_day(&env);
         let withdrawn_today = Self::withdrawn_on(&env, day);
         let new_total = withdrawn_today.saturating_add(amount);
 
@@ -872,8 +1022,10 @@ impl Stellar_CardReceiver {
         // transfer can never observe a stale total and slip a second
         // withdrawal under the daily limit.
         Self::set_withdrawn(&env, day, new_total);
+        env.storage()
+            .instance()
+            .set(&DataKey::WithdrawnToday, &(day, new_total));
 
-        let contract_address = env.current_contract_address();
         let transferred = Self::with_reentrancy_guard(&env, || {
             token::Client::new(&env, &token_contract)
                 .try_transfer(&contract_address, &to, &amount)
@@ -883,6 +1035,9 @@ impl Stellar_CardReceiver {
             // The transfer didn't happen, so it mustn't count against the
             // day's budget: restore the accumulator to its previous value.
             Self::set_withdrawn(&env, day, withdrawn_today);
+            env.storage()
+                .instance()
+                .set(&DataKey::WithdrawnToday, &(day, withdrawn_today));
             return Err(Error::TransferFailed);
         }
 
@@ -923,6 +1078,10 @@ impl Stellar_CardReceiver {
     /// Panics if `caller` does not hold the `Admin` role (the stored admin
     /// always qualifies), if `caller.require_auth()` fails, or if either
     /// limit is provided as <= 0.
+    /// Panics if `caller` does not hold the `Admin` role (or is not the
+    /// stored admin), if `caller.require_auth()` fails, if either limit
+    /// is provided as <= 0, or if both are set and `per_call` exceeds
+    /// `per_day`.
     pub fn set_withdraw_limits(
         env: Env,
         caller: Address,
@@ -931,10 +1090,20 @@ impl Stellar_CardReceiver {
     ) {
         caller.require_auth();
         if !Self::has_authority(&env, &caller, Role::Admin) {
+        if !Self::has_admin_authority(&env, &caller) {
             panic!("set_withdraw_limits requires the Admin role");
         }
         if per_call.is_some_and(|v| v <= 0) || per_day.is_some_and(|v| v <= 0) {
             panic!("withdraw limits must be positive when set");
+        }
+        // Issue #391 (Part 1): a per-call cap above the daily cap can never
+        // be reached, so such a pair is almost certainly a typo (e.g. the
+        // two arguments swapped) and would leave the admin believing a
+        // larger single rescue is allowed than actually is.
+        if let (Some(call), Some(day)) = (per_call, per_day) {
+            if call > day {
+                panic!("per-call withdraw limit cannot exceed the daily limit");
+            }
         }
 
         match per_call {
@@ -985,11 +1154,39 @@ impl Stellar_CardReceiver {
     /// Reads the single `DataKey::DailyWithdrawn` slot; a slot recorded for
     /// an earlier day (or no slot at all) means nothing was withdrawn on
     /// `day`, which is what resets the daily limit at each day boundary.
+    /// Whether `caller` may use the withdraw entrypoints: either the stored
+    /// `DataKey::Admin` address or a holder of the `Admin` role. The stored
+    /// admin was not always auto-granted the Admin *role* (grant_role /
+    /// has_role are a separate system), so both forms of admin authority
+    /// are accepted. Shared by `rescue_tokens` and `set_withdraw_limits`
+    /// so the rule, and its code, exist once (Issue #392 - Part 1).
+    fn has_admin_authority(env: &Env, caller: &Address) -> bool {
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        *caller == stored_admin || Self::has_role(env.clone(), caller.clone(), Role::Admin)
+    }
+
+    /// Returns how much `rescue_tokens` has moved so far during the current
+    /// day (Issue #391 - Part 1), so monitoring can see how much of the
+    /// daily withdraw limit is left before attempting a rescue.
+    pub fn withdrawn_today(env: Env) -> i128 {
+        Self::withdrawn_on(&env, Self::current_day(&env))
+    }
+
+    /// The current day index used for the daily withdraw limit: ledger
+    /// timestamp / 86400, so days roll over at 00:00 UTC.
+    fn current_day(env: &Env) -> u64 {
+        env.ledger().timestamp() / 86_400
+    }
+
+    /// Total recorded against `day` in [`DataKey::WithdrawnToday`]; 0 when
+    /// nothing has been withdrawn yet or the stored total is for an
+    /// earlier day.
     fn withdrawn_on(env: &Env, day: u64) -> i128 {
         match env
             .storage()
             .instance()
             .get::<_, (u64, i128)>(&DataKey::DailyWithdrawn)
+            .get::<_, (u64, i128)>(&DataKey::WithdrawnToday)
         {
             Some((stored_day, total)) if stored_day == day => total,
             _ => 0,
@@ -1041,6 +1238,8 @@ impl Stellar_CardReceiver {
     /// Emits `role_revoked` for the old admin (if it held `Admin`),
     /// `role_granted` for `new_admin` (if its role changed), then
     /// topics=[Symbol("admin_transferred"), old_admin, new_admin], value=()
+    /// # Events (Issue #428 - Part 5)
+    /// Emits: topics=[Symbol("admin_transferred"), old_admin, new_admin], value=()
     ///
     /// # Security
     /// Two-step authorization prevents accidental admin lockout from typos or
@@ -1203,6 +1402,15 @@ impl Stellar_CardReceiver {
 
         // Emit role revoked event (Issue #428 - Part 5)
         Self::remove_role(&env, address, "role_revoked");
+        let key = DataKey::UserRole(address.clone());
+        if !env.storage().persistent().has(&key) {
+            return;
+        }
+        env.storage().persistent().remove(&key);
+
+        // Emit role revoked event (Issue #428 - Part 5)
+        env.events()
+            .publish((Symbol::new(&env, "role_revoked"), address), ());
     }
 
     /// Allows the caller to give up their own role, without requiring the
@@ -1284,6 +1492,31 @@ impl Stellar_CardReceiver {
         }
     }
 
+    }
+
+    /// Checks if an address has at least the specified role or higher.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `address` - The address to check
+    /// * `required_role` - The minimum required role
+    ///
+    /// # Returns
+    /// `true` if the address has the required role or higher in hierarchy, `false` otherwise
+    ///
+    /// # Hierarchy
+    /// Admin > Operator > Viewer
+    pub fn has_role(env: Env, address: Address, required_role: Role) -> bool {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, Role>(&DataKey::UserRole(address))
+        {
+            Some(user_role) => Self::is_role_sufficient(&user_role, &required_role),
+            None => false,
+        }
+    }
+
     /// Checks whether a user role satisfies a required role level.
     ///
     /// # Arguments
@@ -1329,6 +1562,13 @@ impl Stellar_CardReceiver {
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         *caller == stored_admin || Self::has_role(env.clone(), caller.clone(), required)
     }
+        match (user_role, required_role) {
+            (Role::Admin, _) => true,
+            (Role::Operator, Role::Operator) | (Role::Operator, Role::Viewer) => true,
+            (Role::Viewer, Role::Viewer) => true,
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1340,6 +1580,10 @@ mod test {
         testutils::{
             Address as _, AuthorizedFunction, AuthorizedInvocation, Events, IssuerFlags,
             Ledger as _, MockAuth, MockAuthInvoke,
+    use super::*;
+    use soroban_sdk::{
+        testutils::{
+            storage::Instance as _, Address as _, Events, Ledger as _, MockAuth, MockAuthInvoke,
         },
         token, Bytes, Env, IntoVal, Symbol, TryIntoVal,
     };
@@ -1654,6 +1898,78 @@ mod test {
         assert_eq!(client.get_role(&f.admin), Some(Role::Admin));
     }
 
+    // ── native-asset validation (issue #389) ──────────────────────────────────
+
+    /// Deploys the native XLM Stellar Asset Contract. XDR `Asset::Native` is
+    /// its 4-byte discriminant, 0.
+    fn register_native_sac(env: &Env) -> Address {
+        env.deployer()
+            .with_stellar_asset(Bytes::from_array(env, &[0u8; 4]))
+            .deploy()
+    }
+
+    /// A 7-decimal token that doesn't implement `name()`.
+    mod seven_decimal_token_without_name {
+        use soroban_sdk::{contract, contractimpl, Env};
+
+        #[contract]
+        pub struct NamelessToken;
+
+        #[contractimpl]
+        impl NamelessToken {
+            pub fn decimals(_env: Env) -> u32 {
+                7
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "usdc_contract cannot be the native XLM asset contract")]
+    fn test_init_rejects_native_xlm_sac_as_usdc_contract() {
+        // Both SACs report 7 decimals, so only the native-asset check can
+        // catch USDC and XLM being passed in swapped order.
+        let f = Fixture::new();
+        let native = register_native_sac(&f.env);
+        f.client().init(&f.admin, &f.treasury, &native, &f.usdc);
+    }
+
+    #[test]
+    fn test_init_accepts_native_xlm_sac_as_xlm_contract() {
+        let f = Fixture::new();
+        let native = register_native_sac(&f.env);
+        f.client().init(&f.admin, &f.treasury, &f.usdc, &native);
+        assert_eq!(f.client().xlm_contract(), native);
+        assert_eq!(f.client().usdc_contract(), f.usdc);
+    }
+
+    #[test]
+    fn test_init_accepts_usdc_contract_without_name() {
+        // `name()` is only consulted to spot the native asset; the decimals
+        // probe alone decides whether an address is a token.
+        let f = Fixture::new();
+        let token = f
+            .env
+            .register(seven_decimal_token_without_name::NamelessToken, ());
+        f.client().init(&f.admin, &f.treasury, &token, &f.xlm_sac);
+        assert_eq!(f.client().usdc_contract(), token);
+    }
+
+    #[test]
+    fn test_swapped_token_init_leaves_contract_uninitialized_and_retryable() {
+        let f = Fixture::new();
+        let client = f.client();
+        let native = register_native_sac(&f.env);
+
+        assert!(client
+            .try_init(&f.admin, &f.treasury, &native, &f.usdc)
+            .is_err());
+        assert!(client.try_admin().is_err());
+        assert_eq!(contract_event_count(&f.env, &f.contract_id, "init"), 0);
+
+        client.init(&f.admin, &f.treasury, &f.usdc, &native);
+        assert_eq!(client.xlm_contract(), native);
+    }
+
     #[test]
     fn test_init_accepts_a_contract_address_as_treasury() {
         // The treasury only receives transfers, so a contract (e.g. a
@@ -1696,6 +2012,10 @@ mod test {
         let oid = order_bytes(&f.env, "test-order-usdc");
         f.client().pay_usdc(&f.payer, &amount, &oid);
 
+
+        let oid = order_bytes(&f.env, "test-order-usdc");
+        f.client().pay_usdc(&f.payer, &amount, &oid);
+
         // Scan events for our contract's pay_usdc event.
         // Events are (contract_id, topics: Vec<Val>, data: Val).
         // Val doesn't implement PartialEq — use try_into_val for typed comparison.
@@ -1725,6 +2045,22 @@ mod test {
     #[should_panic]
     fn test_pay_usdc_requires_auth() {
         let env = Env::default();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let usdc = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let xlm_sac = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let contract_id = env.register(Stellar_CardReceiver, ());
+        let client = Stellar_CardReceiverClient::new(&env, &contract_id);
+
+        env.mock_all_auths();
+        client.init(&admin, &treasury, &usdc, &xlm_sac);
+
 
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
@@ -1916,6 +2252,154 @@ mod test {
     }
 
     // ── init auth test ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_init_requires_admin_auth() {
+        let env = Env::default();
+        // No mock_all_auths — only the admin can authorize
+        env.mock_auths(&[]);
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let usdc = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let xlm_sac = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let contract_id = env.register(Stellar_CardReceiver, ());
+        let client = Stellar_CardReceiverClient::new(&env, &contract_id);
+
+        // Should panic because admin.require_auth() fires and no auth is mocked
+        let result = client.try_init(&admin, &treasury, &usdc, &xlm_sac);
+        assert!(result.is_err(), "init should require admin authorization");
+    }
+
+    // ── reentrancy guard tests ──────────────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "reentrancy detected")]
+    fn test_reentrancy_guard_panics_on_reentry() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 10_000_000;
+        f.mint_usdc(&f.payer, amount * 2);
+
+        // Set the reentrancy guard from within the contract context
+        f.env.as_contract(&f.contract_id, || {
+            f.env
+                .storage()
+                .temporary()
+                .set(&DataKey::ReentrancyGuard, &true);
+        });
+
+        let oid1 = order_bytes(&f.env, "reentry-1");
+        f.client().pay_usdc(&f.payer, &amount, &oid1);
+    }
+
+    #[test]
+    fn test_reentrancy_guard_resets_after_successful_transfer() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 5_000_000;
+        f.mint_usdc(&f.payer, amount * 2);
+
+        let oid1 = order_bytes(&f.env, "sequential-1");
+        f.client().pay_usdc(&f.payer, &amount, &oid1);
+
+        // Guard should be reset — second call should succeed
+        let oid2 = order_bytes(&f.env, "sequential-2");
+        f.client().pay_usdc(&f.payer, &amount, &oid2);
+
+        assert_eq!(f.usdc_balance(&f.treasury), amount * 2);
+        assert_eq!(f.usdc_balance(&f.payer), 0);
+    }
+
+    #[test]
+    fn test_reentrancy_guard_resets_for_xlm_after_successful_transfer() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 5_000_000;
+        f.mint_xlm(&f.payer, amount * 2);
+
+        let oid1 = order_bytes(&f.env, "xlm-sequential-1");
+        f.client().pay_xlm(&f.payer, &amount, &oid1);
+
+        let oid2 = order_bytes(&f.env, "xlm-sequential-2");
+        f.client().pay_xlm(&f.payer, &amount, &oid2);
+
+        assert_eq!(f.xlm_balance(&f.treasury), amount * 2);
+    }
+
+    #[test]
+    fn test_reentrancy_guard_resets_after_failed_transfer() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 10_000_000;
+        f.mint_usdc(&f.payer, amount / 2); // only half balance to cause a failure
+
+        let oid1 = order_bytes(&f.env, "failed-1");
+        let result = f.client().try_pay_usdc(&f.payer, &amount, &oid1);
+        assert!(result.is_err(), "should fail with insufficient balance");
+
+        // Now give sufficient balance
+        f.mint_usdc(&f.payer, amount);
+
+        // Guard should have reset, so this should succeed
+        let oid2 = order_bytes(&f.env, "success-after-fail");
+        f.client().pay_usdc(&f.payer, &amount, &oid2);
+
+        assert_eq!(f.usdc_balance(&f.treasury), amount);
+    }
+
+    #[test]
+    fn test_reentrancy_guard_resets_for_xlm_after_failed_transfer() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 5_000_000;
+        f.mint_xlm(&f.payer, amount / 2);
+
+        let oid1 = order_bytes(&f.env, "xlm-failed-1");
+        let result = f.client().try_pay_xlm(&f.payer, &amount, &oid1);
+        assert!(result.is_err(), "should fail with insufficient balance");
+
+        // Now give sufficient balance
+        f.mint_xlm(&f.payer, amount);
+
+        // Guard should have reset, so this should succeed
+        let oid2 = order_bytes(&f.env, "xlm-success-after-fail");
+        f.client().pay_xlm(&f.payer, &amount, &oid2);
+
+        assert_eq!(f.xlm_balance(&f.treasury), amount);
+    }
+
+    // ── reentrancy guard: rescue_tokens and callbacks (issue #397) ─────────
+
+    /// A deliberately hostile "token" whose `transfer` tries to call back
+    /// into the receiver contract, the way a malicious token passed to
+    /// `rescue_tokens` could. It records whether the callback got through.
+    mod reentrant_token {
+        use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env};
+
+        #[contracttype]
+        enum Key {
+            Receiver,
+            CallbackSucceeded,
+        }
+
+        #[contract]
+        pub struct ReentrantToken;
+
+        #[contractimpl]
+        impl ReentrantToken {
+            pub fn set_receiver(env: Env, receiver: Address) {
+                env.storage().instance().set(&Key::Receiver, &receiver);
+            }
 
     #[test]
     fn test_init_requires_admin_auth() {
@@ -2370,6 +2854,135 @@ mod test {
 
     #[test]
     fn test_pay_xlm_insufficient_balance_leaves_balances_unchanged() {
+
+        let amount: i128 = 1; // 0.0000001 USDC
+        f.mint_usdc(&f.payer, amount);
+
+        let oid = order_bytes(&f.env, "min-usdc");
+        f.client().pay_usdc(&f.payer, &amount, &oid);
+
+        assert_eq!(f.usdc_balance(&f.treasury), 1);
+        assert_eq!(f.usdc_balance(&f.payer), 0);
+    }
+
+    #[test]
+    fn test_pay_xlm_smallest_positive_amount() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 1; // 1 stroop
+        f.mint_xlm(&f.payer, amount);
+
+        let oid = order_bytes(&f.env, "min-xlm");
+        f.client().pay_xlm(&f.payer, &amount, &oid);
+
+        assert_eq!(f.xlm_balance(&f.treasury), 1);
+        assert_eq!(f.xlm_balance(&f.payer), 0);
+    }
+
+    #[test]
+    fn test_pay_usdc_large_amount() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 1_000_000_000_000; // 100,000 USDC
+        f.mint_usdc(&f.payer, amount);
+
+        let oid = order_bytes(&f.env, "large-usdc");
+        f.client().pay_usdc(&f.payer, &amount, &oid);
+
+        assert_eq!(f.usdc_balance(&f.treasury), amount);
+    }
+
+    #[test]
+    fn test_pay_xlm_large_amount() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 1_000_000_000_000_000; // 100M XLM
+        f.mint_xlm(&f.payer, amount);
+
+        let oid = order_bytes(&f.env, "large-xlm");
+        f.client().pay_xlm(&f.payer, &amount, &oid);
+
+        assert_eq!(f.xlm_balance(&f.treasury), amount);
+    }
+
+    #[test]
+    fn test_pay_usdc_insufficient_balance_panics() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 10_000_000;
+        f.mint_usdc(&f.payer, amount / 2); // only half
+
+        let oid = order_bytes(&f.env, "insufficient-usdc");
+        let result = f.client().try_pay_usdc(&f.payer, &amount, &oid);
+        assert!(result.is_err(), "should fail with insufficient balance");
+    }
+
+    #[test]
+    fn test_pay_xlm_insufficient_balance_panics() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 10_000_000;
+        f.mint_xlm(&f.payer, amount / 2);
+
+        let oid = order_bytes(&f.env, "insufficient-xlm");
+        let result = f.client().try_pay_xlm(&f.payer, &amount, &oid);
+        assert!(result.is_err(), "should fail with insufficient balance");
+    }
+
+    // ── failed-transfer error/balance semantics (Issue #413 - Part 4) ────────
+
+    #[test]
+    fn test_pay_usdc_insufficient_balance_returns_transfer_failed_error() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 10_000_000;
+        f.mint_usdc(&f.payer, amount / 2);
+
+        let oid = order_bytes(&f.env, "insufficient-usdc-variant");
+        let result = f.client().try_pay_usdc(&f.payer, &amount, &oid);
+        assert_eq!(result, Err(Ok(Error::TransferFailed)));
+    }
+
+    #[test]
+    fn test_pay_xlm_insufficient_balance_returns_transfer_failed_error() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 10_000_000;
+        f.mint_xlm(&f.payer, amount / 2);
+
+        let oid = order_bytes(&f.env, "insufficient-xlm-variant");
+        let result = f.client().try_pay_xlm(&f.payer, &amount, &oid);
+        assert_eq!(result, Err(Ok(Error::TransferFailed)));
+    }
+
+    #[test]
+    fn test_pay_usdc_insufficient_balance_leaves_balances_unchanged() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 10_000_000;
+        let available = amount / 2;
+        f.mint_usdc(&f.payer, available);
+
+        let oid = order_bytes(&f.env, "insufficient-usdc-no-partial");
+        let result = f.client().try_pay_usdc(&f.payer, &amount, &oid);
+        assert!(result.is_err());
+
+        // A rejected token::Client transfer must not move any funds --
+        // the payer keeps every unit they had, and the treasury sees none.
+        assert_eq!(f.usdc_balance(&f.payer), available);
+        assert_eq!(f.usdc_balance(&f.treasury), 0);
+    }
+
+    #[test]
+    fn test_pay_xlm_insufficient_balance_leaves_balances_unchanged() {
         let f = Fixture::new();
         f.init();
 
@@ -2679,6 +3292,365 @@ mod test {
         f.init();
 
         let amount: i128 = 10_000_000;
+        let available = amount / 2;
+        f.mint_xlm(&f.payer, available);
+
+        let oid = order_bytes(&f.env, "insufficient-xlm-no-partial");
+        let result = f.client().try_pay_xlm(&f.payer, &amount, &oid);
+        assert!(result.is_err());
+
+        assert_eq!(f.xlm_balance(&f.payer), available);
+        assert_eq!(f.xlm_balance(&f.treasury), 0);
+    }
+
+    #[test]
+    fn test_pay_usdc_with_zero_balance_payer_fails_cleanly() {
+        let f = Fixture::new();
+        f.init();
+
+        // Payer never received any USDC at all -- not just "not enough".
+        let amount: i128 = 5_000_000;
+        let oid = order_bytes(&f.env, "zero-balance-usdc");
+        let result = f.client().try_pay_usdc(&f.payer, &amount, &oid);
+
+        assert_eq!(result, Err(Ok(Error::TransferFailed)));
+        assert_eq!(f.usdc_balance(&f.payer), 0);
+        assert_eq!(f.usdc_balance(&f.treasury), 0);
+    }
+
+    #[test]
+    fn test_pay_xlm_with_zero_balance_payer_fails_cleanly() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 5_000_000;
+        let oid = order_bytes(&f.env, "zero-balance-xlm");
+        let result = f.client().try_pay_xlm(&f.payer, &amount, &oid);
+
+        assert_eq!(result, Err(Ok(Error::TransferFailed)));
+        assert_eq!(f.xlm_balance(&f.payer), 0);
+        assert_eq!(f.xlm_balance(&f.treasury), 0);
+        f.mint_usdc(&f.payer, amount);
+
+        let order_id = "exact-match-order-12345";
+        let oid = order_bytes(&f.env, order_id);
+        f.client().pay_usdc(&f.payer, &amount, &oid);
+
+        let events = f.env.events().all();
+        let mut found = false;
+        for (contract_addr, topics, _) in events.iter() {
+            if contract_addr != f.contract_id {
+                continue;
+            }
+            let sym: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
+            if sym != Symbol::new(&f.env, "pay_usdc") {
+                continue;
+            }
+            let emitted_oid: Bytes = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
+            let emitted_bytes = order_bytes(&f.env, order_id);
+            if emitted_oid == emitted_bytes {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "order_id should match exactly");
+    }
+
+    #[test]
+    fn test_treasury_getter_returns_consistent_value() {
+        let f = Fixture::new();
+        f.init();
+
+        for _ in 0..5 {
+            assert_eq!(f.client().treasury(), f.treasury);
+        }
+    }
+
+    // ── partial-spend and no-custody invariants (Issue #413 - Part 4) ────────
+
+    #[test]
+    fn test_pay_usdc_leaves_remainder_with_payer_when_paying_less_than_balance() {
+        let f = Fixture::new();
+        f.init();
+
+        let minted: i128 = 30_000_000;
+        let paid: i128 = 12_000_000;
+        f.mint_usdc(&f.payer, minted);
+
+        let oid = order_bytes(&f.env, "partial-spend-usdc");
+        f.client().pay_usdc(&f.payer, &paid, &oid);
+
+        assert_eq!(f.usdc_balance(&f.payer), minted - paid);
+        assert_eq!(f.usdc_balance(&f.treasury), paid);
+    }
+
+    #[test]
+    fn test_pay_xlm_leaves_remainder_with_payer_when_paying_less_than_balance() {
+        let f = Fixture::new();
+        f.init();
+
+        let minted: i128 = 30_000_000;
+        let paid: i128 = 12_000_000;
+        f.mint_xlm(&f.payer, minted);
+
+        let oid = order_bytes(&f.env, "partial-spend-xlm");
+        f.client().pay_xlm(&f.payer, &paid, &oid);
+
+        assert_eq!(f.xlm_balance(&f.payer), minted - paid);
+        assert_eq!(f.xlm_balance(&f.treasury), paid);
+    fn test_usdc_contract_getter_returns_consistent_value() {
+        let f = Fixture::new();
+        f.init();
+
+        for _ in 0..5 {
+            assert_eq!(f.client().usdc_contract(), f.usdc);
+        }
+    }
+
+    #[test]
+    fn test_xlm_contract_getter_returns_consistent_value() {
+        let f = Fixture::new();
+        f.init();
+
+        for _ in 0..5 {
+            assert_eq!(f.client().xlm_contract(), f.xlm_sac);
+        }
+    }
+
+    #[test]
+    fn test_admin_getter_returns_consistent_value() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 8_000_000;
+        f.mint_usdc(&f.payer, amount);
+
+        let oid = order_bytes(&f.env, "no-custody-usdc");
+        f.client().pay_usdc(&f.payer, &amount, &oid);
+
+        // pay_usdc forwards straight from payer to treasury in the same
+        // call -- the contract itself must never end up holding a balance.
+        assert_eq!(f.usdc_balance(&f.contract_id), 0);
+        for _ in 0..5 {
+            assert_eq!(f.client().admin(), f.admin);
+        }
+    }
+
+    #[test]
+    fn test_pay_usdc_with_various_order_id_formats() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 8_000_000;
+        f.mint_xlm(&f.payer, amount);
+
+        let oid = order_bytes(&f.env, "no-custody-xlm");
+        f.client().pay_xlm(&f.payer, &amount, &oid);
+
+        assert_eq!(f.xlm_balance(&f.contract_id), 0);
+    }
+
+    #[test]
+    fn test_pay_usdc_does_not_affect_xlm_contract_balance() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 8_000_000;
+        f.mint_usdc(&f.payer, amount);
+        f.mint_xlm(&f.payer, amount);
+
+        f.client()
+            .pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "usdc-only"));
+
+        // Only the USDC leg moved; the payer's XLM balance (minted from a
+        // separate SAC) must be completely untouched.
+        assert_eq!(f.usdc_balance(&f.payer), 0);
+        assert_eq!(f.xlm_balance(&f.payer), amount);
+        assert_eq!(f.xlm_balance(&f.treasury), 0);
+    }
+
+    #[test]
+    fn test_pay_xlm_does_not_affect_usdc_contract_balance() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 8_000_000;
+        f.mint_usdc(&f.payer, amount);
+        f.mint_xlm(&f.payer, amount);
+
+        f.client()
+            .pay_xlm(&f.payer, &amount, &order_bytes(&f.env, "xlm-only"));
+
+        assert_eq!(f.xlm_balance(&f.payer), 0);
+        assert_eq!(f.usdc_balance(&f.payer), amount);
+        assert_eq!(f.usdc_balance(&f.treasury), 0);
+    }
+
+    #[test]
+    fn test_multiple_payments_accumulate_in_treasury() {
+        let f = Fixture::new();
+        f.init();
+
+        let usdc_amount: i128 = 10_000_000;
+        let xlm_amount: i128 = 20_000_000;
+
+        f.mint_usdc(&f.payer, usdc_amount * 2);
+        f.mint_xlm(&f.payer, xlm_amount * 3);
+
+        f.client()
+            .pay_usdc(&f.payer, &usdc_amount, &order_bytes(&f.env, "multi-1"));
+        f.client()
+            .pay_usdc(&f.payer, &usdc_amount, &order_bytes(&f.env, "multi-2"));
+        f.client()
+            .pay_xlm(&f.payer, &xlm_amount, &order_bytes(&f.env, "multi-3"));
+        f.client()
+            .pay_xlm(&f.payer, &xlm_amount, &order_bytes(&f.env, "multi-4"));
+        f.client()
+            .pay_xlm(&f.payer, &xlm_amount, &order_bytes(&f.env, "multi-5"));
+
+        assert_eq!(f.usdc_balance(&f.treasury), usdc_amount * 2);
+        assert_eq!(f.xlm_balance(&f.treasury), xlm_amount * 3);
+        assert_eq!(f.usdc_balance(&f.payer), 0);
+        assert_eq!(f.xlm_balance(&f.payer), 0);
+    }
+
+    #[test]
+    fn test_different_payers_pay_independently() {
+        let f = Fixture::new();
+        f.init();
+
+        let payer2 = Address::generate(&f.env);
+        let amount: i128 = 10_000_000;
+
+        f.mint_usdc(&f.payer, amount);
+        f.mint_usdc(&payer2, amount);
+
+        f.client()
+            .pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "payer1-order"));
+        f.client()
+            .pay_usdc(&payer2, &amount, &order_bytes(&f.env, "payer2-order"));
+
+        assert_eq!(f.usdc_balance(&f.treasury), amount * 2);
+        assert_eq!(f.usdc_balance(&f.payer), 0);
+        assert_eq!(f.usdc_balance(&payer2), 0);
+    }
+
+    #[test]
+    fn test_getters_after_init() {
+        let f = Fixture::new();
+        f.init();
+
+        assert_eq!(f.client().admin(), f.admin);
+        assert_eq!(f.client().treasury(), f.treasury);
+        assert_eq!(f.client().usdc_contract(), f.usdc);
+        assert_eq!(f.client().xlm_contract(), f.xlm_sac);
+    }
+
+    #[test]
+    fn test_try_admin_before_init_returns_err() {
+        let env = Env::default();
+        let contract_id = env.register(Stellar_CardReceiver, ());
+        let client = Stellar_CardReceiverClient::new(&env, &contract_id);
+
+        assert!(client.try_admin().is_err());
+    }
+
+    #[test]
+    fn test_empty_order_id_accepted() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 1_000_000;
+        f.mint_usdc(&f.payer, amount);
+
+        let oid = Bytes::new(&f.env);
+        f.client().pay_usdc(&f.payer, &amount, &oid);
+
+        assert_eq!(f.usdc_balance(&f.treasury), amount);
+    }
+
+    #[test]
+    fn test_long_order_id_accepted() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 1_000_000;
+        f.mint_usdc(&f.payer, amount);
+
+        let long_id = "a".repeat(200);
+        let oid = order_bytes(&f.env, &long_id);
+        f.client().pay_usdc(&f.payer, &amount, &oid);
+
+        assert_eq!(f.usdc_balance(&f.treasury), amount);
+    }
+
+    #[test]
+    fn test_init_stores_correct_admin() {
+        let f = Fixture::new();
+        f.init();
+        assert_eq!(f.client().admin(), f.admin);
+    }
+
+    // ── comprehensive edge-case and error handling tests ──────────────────────
+
+    #[test]
+    fn test_pay_usdc_with_max_i128() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = i128::MAX / 2;
+        f.mint_usdc(&f.payer, amount);
+
+        let oid = order_bytes(&f.env, "max-i128");
+        f.client().pay_usdc(&f.payer, &amount, &oid);
+
+        assert_eq!(f.usdc_balance(&f.treasury), amount);
+    }
+
+    #[test]
+    fn test_pay_xlm_with_max_i128() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = i128::MAX / 2;
+        f.mint_xlm(&f.payer, amount);
+
+        let oid = order_bytes(&f.env, "max-xlm");
+        f.client().pay_xlm(&f.payer, &amount, &oid);
+
+        assert_eq!(f.xlm_balance(&f.treasury), amount);
+    }
+
+    #[test]
+    fn test_concurrent_payments_from_different_payers() {
+        let f = Fixture::new();
+        f.init();
+
+        let payer1 = Address::generate(&f.env);
+        let payer2 = Address::generate(&f.env);
+        let payer3 = Address::generate(&f.env);
+
+        let amount: i128 = 10_000_000;
+        f.mint_usdc(&payer1, amount);
+        f.mint_usdc(&payer2, amount);
+        f.mint_usdc(&payer3, amount);
+
+        f.client()
+            .pay_usdc(&payer1, &amount, &order_bytes(&f.env, "payer1"));
+        f.client()
+            .pay_usdc(&payer2, &amount, &order_bytes(&f.env, "payer2"));
+        f.client()
+            .pay_usdc(&payer3, &amount, &order_bytes(&f.env, "payer3"));
+
+        assert_eq!(f.usdc_balance(&f.treasury), amount * 3);
+    }
+
+    #[test]
+    fn test_pay_usdc_with_exact_order_id_match() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 10_000_000;
         f.mint_usdc(&f.payer, amount);
 
         let order_id = "exact-match-order-12345";
@@ -2747,6 +3719,55 @@ mod test {
 
     #[test]
     fn test_pay_usdc_with_various_order_id_formats() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 1_000_000;
+
+        let test_cases = [
+            "",
+            "order-1",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "123456789",
+            "!@#$%^&*()",
+            "order\nwith\nnewlines",
+        ];
+
+        for order_id in test_cases.iter() {
+            f.mint_usdc(&f.payer, amount);
+            let oid = order_bytes(&f.env, order_id);
+            f.client().pay_usdc(&f.payer, &amount, &oid);
+        }
+
+        assert_eq!(
+            f.usdc_balance(&f.treasury),
+            amount * test_cases.len() as i128
+        );
+    }
+
+    #[test]
+    fn test_role_check_with_unassigned_user_returns_false() {
+        let f = Fixture::new();
+        f.init();
+
+        let user = Address::generate(&f.env);
+
+        assert!(!f.client().has_role(&user, &Role::Admin));
+        assert!(!f.client().has_role(&user, &Role::Operator));
+        assert!(!f.client().has_role(&user, &Role::Viewer));
+    }
+
+    #[test]
+    fn test_get_role_returns_none_for_unassigned_user() {
+        let f = Fixture::new();
+        f.init();
+
+        let user = Address::generate(&f.env);
+        assert_eq!(f.client().get_role(&user), None);
+    }
+
+    #[test]
+    fn test_pay_operations_increment_ttl() {
         let f = Fixture::new();
         f.init();
 
@@ -3957,6 +4978,164 @@ mod test {
         );
     }
 
+    // ── withdraw limit protections (issue #391) ─────────────────────────────────
+
+    fn advance_days(f: &Fixture, days: u64) {
+        f.env.ledger().with_mut(|li| {
+            li.timestamp += days * 86_400;
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "per-call withdraw limit cannot exceed the daily limit")]
+    fn test_set_withdraw_limits_rejects_per_call_above_daily() {
+        let f = Fixture::new();
+        f.init();
+        f.client()
+            .set_withdraw_limits(&f.admin, &Some(5_000_000), &Some(1_000_000));
+    }
+
+    #[test]
+    fn test_set_withdraw_limits_accepts_per_call_equal_to_daily() {
+        let f = Fixture::new();
+        f.init();
+        f.client()
+            .set_withdraw_limits(&f.admin, &Some(1_000_000), &Some(1_000_000));
+        assert_eq!(
+            f.client().withdraw_limits(),
+            (Some(1_000_000), Some(1_000_000))
+        );
+    }
+
+    #[test]
+    fn test_set_withdraw_limits_allows_any_per_call_when_daily_unset() {
+        // The ordering rule only applies when both limits are set.
+        let f = Fixture::new();
+        f.init();
+        f.client()
+            .set_withdraw_limits(&f.admin, &Some(i128::MAX), &None);
+        assert_eq!(f.client().withdraw_limits(), (Some(i128::MAX), None));
+    }
+
+    #[test]
+    fn test_rejected_withdraw_limits_leave_previous_limits_in_place() {
+        let f = Fixture::new();
+        f.init();
+        f.client()
+            .set_withdraw_limits(&f.admin, &Some(100), &Some(1_000));
+
+        assert!(f
+            .client()
+            .try_set_withdraw_limits(&f.admin, &Some(2_000), &Some(1_000))
+            .is_err());
+        assert_eq!(f.client().withdraw_limits(), (Some(100), Some(1_000)));
+        assert_eq!(
+            contract_event_count(&f.env, &f.contract_id, "withdraw_limits_set"),
+            0
+        );
+    }
+
+    #[test]
+    fn test_rescue_tokens_to_contract_itself_returns_err() {
+        let f = Fixture::new();
+        f.init();
+        f.client()
+            .set_withdraw_limits(&f.admin, &None, &Some(1_000_000));
+        f.mint_usdc(&f.contract_id, 1_000_000);
+
+        let result = f
+            .client()
+            .try_rescue_tokens(&f.admin, &f.usdc, &f.contract_id, &1_000_000);
+
+        assert_eq!(result, Err(Ok(Error::InvalidRecipient)));
+        // Nothing moved and none of the day's budget was spent, so a
+        // genuine rescue of the full balance still fits under the limit.
+        assert_eq!(f.client().withdrawn_today(), 0);
+        let destination = Address::generate(&f.env);
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &destination, &1_000_000);
+        assert_eq!(f.usdc_balance(&destination), 1_000_000);
+    }
+
+    #[test]
+    fn test_withdrawn_today_tracks_successful_rescues_only() {
+        let f = Fixture::new();
+        f.init();
+        assert_eq!(f.client().withdrawn_today(), 0);
+
+        f.mint_usdc(&f.contract_id, 1_000);
+        let destination = Address::generate(&f.env);
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &destination, &300);
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &destination, &200);
+        assert_eq!(f.client().withdrawn_today(), 500);
+
+        // Fails at the token (balance is only 500): not counted.
+        assert_eq!(
+            f.client()
+                .try_rescue_tokens(&f.admin, &f.usdc, &destination, &600),
+            Err(Ok(Error::TransferFailed))
+        );
+        assert_eq!(f.client().withdrawn_today(), 500);
+    }
+
+    #[test]
+    fn test_withdrawn_today_resets_on_the_next_day() {
+        let f = Fixture::new();
+        f.init();
+        f.client()
+            .set_withdraw_limits(&f.admin, &None, &Some(1_000));
+        f.mint_usdc(&f.contract_id, 2_000);
+        let destination = Address::generate(&f.env);
+
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &destination, &1_000);
+        assert_eq!(f.client().withdrawn_today(), 1_000);
+
+        advance_days(&f, 1);
+        assert_eq!(f.client().withdrawn_today(), 0);
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &destination, &1_000);
+        assert_eq!(f.client().withdrawn_today(), 1_000);
+    }
+
+    #[test]
+    fn test_daily_withdraw_accumulator_uses_a_single_storage_slot() {
+        // Rescues on many different days must keep overwriting one entry
+        // rather than leaving a key behind per day in instance storage,
+        // which every call loads and pays rent on.
+        let f = Fixture::new();
+        f.init();
+        f.mint_usdc(&f.contract_id, 10);
+        let destination = Address::generate(&f.env);
+
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &destination, &1);
+        let entries_after_first_day = f
+            .env
+            .as_contract(&f.contract_id, || f.env.storage().instance().all().len());
+
+        for _ in 0..5 {
+            advance_days(&f, 1);
+            f.client()
+                .rescue_tokens(&f.admin, &f.usdc, &destination, &1);
+        }
+
+        let entries_after_six_days = f
+            .env
+            .as_contract(&f.contract_id, || f.env.storage().instance().all().len());
+        assert_eq!(entries_after_six_days, entries_after_first_day);
+        assert_eq!(
+            f.env.as_contract(&f.contract_id, || f
+                .env
+                .storage()
+                .instance()
+                .get::<_, (u64, i128)>(&DataKey::WithdrawnToday)),
+            Some((f.env.ledger().timestamp() / 86_400, 1))
+        );
+    }
+
     // ── transfer_admin tests ──────────────────────────────────────────────────
 
     #[test]
@@ -4293,6 +5472,55 @@ mod test {
     }
 
     #[test]
+    fn test_long_order_id_xlm() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 1_000_000;
+        f.mint_xlm(&f.payer, amount);
+
+        let long_id = "x".repeat(200);
+        let oid = order_bytes(&f.env, &long_id);
+        f.client().pay_xlm(&f.payer, &amount, &oid);
+
+        assert_eq!(f.xlm_balance(&f.treasury), amount);
+    }
+
+    #[test]
+    fn test_pay_usdc_with_fractional_amount() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 1_500_000; // 1.5 USDC
+        f.mint_usdc(&f.payer, amount);
+
+        let oid = order_bytes(&f.env, "fractional");
+        f.client().pay_usdc(&f.payer, &amount, &oid);
+
+        assert_eq!(f.usdc_balance(&f.treasury), amount);
+    }
+
+    #[test]
+    fn test_pay_xlm_minimum_stroops() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 1;
+        f.mint_xlm(&f.payer, amount);
+
+        let oid = order_bytes(&f.env, "min-stroops");
+        f.client().pay_xlm(&f.payer, &amount, &oid);
+
+        assert_eq!(f.xlm_balance(&f.treasury), 1);
+    }
+
+    mod upgrade_wasm {
+        soroban_sdk::contractimport!(
+            file = "target/wasm32v1-none/release/stellar_card_receiver.wasm"
+        );
+    }
+
+    #[test]
     fn test_upgrade_works() {
         let f = Fixture::new();
         f.init();
@@ -4322,6 +5550,67 @@ mod test {
             found = true;
         }
         assert!(found, "upgrade event not found");
+    }
+
+    // ── WASM size (issue #392) ────────────────────────────────────────────────
+
+    /// Raw (pre-`stellar contract optimize`) size budget. Mirrors
+    /// `WASM_SIZE_BUDGET_BYTES` in the Makefile — keep the two in sync.
+    const WASM_SIZE_BUDGET_BYTES: usize = 49_152;
+    /// Soroban's network-enforced ceiling on contract code size.
+    const NETWORK_WASM_SIZE_LIMIT_BYTES: usize = 65_536;
+
+    #[test]
+    fn test_wasm_within_size_budget() {
+        // Runs as part of every `cargo test`, so a size regression fails
+        // locally without needing `make build`'s separate budget check.
+        let size = upgrade_wasm::WASM.len();
+        assert!(
+            size <= WASM_SIZE_BUDGET_BYTES,
+            "contract WASM is {size} bytes, over its {WASM_SIZE_BUDGET_BYTES}-byte budget \
+             by {} bytes",
+            size - WASM_SIZE_BUDGET_BYTES
+        );
+        assert!(WASM_SIZE_BUDGET_BYTES < NETWORK_WASM_SIZE_LIMIT_BYTES);
+    }
+
+    #[test]
+    fn test_wasm_has_no_custom_sections_beyond_contract_metadata() {
+        // `strip = "symbols"` + `debug = 0` should leave only the sections
+        // Soroban itself reads (contract spec / env and SDK metadata). A
+        // `name` or DWARF `.debug_*` section showing up means the release
+        // profile stopped stripping and the binary grew for nothing.
+        let wasm = upgrade_wasm::WASM;
+        let mut offset = 8; // "\0asm" magic + version
+        while offset < wasm.len() {
+            let id = wasm[offset];
+            offset += 1;
+            let (len, used) = read_leb128_u32(&wasm[offset..]);
+            offset += used;
+            if id == 0 {
+                let (name_len, name_used) = read_leb128_u32(&wasm[offset..]);
+                let start = offset + name_used;
+                let name = core::str::from_utf8(&wasm[start..start + name_len as usize]).unwrap();
+                assert!(
+                    name.starts_with("contract"),
+                    "unexpected custom section `{name}` in release WASM"
+                );
+            }
+            offset += len as usize;
+        }
+        assert_eq!(offset, wasm.len());
+    }
+
+    /// Decodes an unsigned LEB128 `u32`, returning `(value, bytes_read)`.
+    fn read_leb128_u32(bytes: &[u8]) -> (u32, usize) {
+        let mut value = 0u32;
+        for (i, byte) in bytes.iter().enumerate() {
+            value |= u32::from(byte & 0x7f) << (7 * i);
+            if byte & 0x80 == 0 {
+                return (value, i + 1);
+            }
+        }
+        panic!("truncated LEB128");
     }
 
     // ── init events test ───────────────────────────────────────────────────
