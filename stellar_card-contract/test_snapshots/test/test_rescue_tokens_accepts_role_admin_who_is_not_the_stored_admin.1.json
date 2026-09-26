@@ -523,12 +523,22 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "Paused"
+                              "symbol": "DailyWithdrawn"
                             }
                           ]
                         },
                         "val": {
-                          "bool": false
+                          "vec": [
+                            {
+                              "u64": 0
+                            },
+                            {
+                              "i128": {
+                                "hi": 0,
+                                "lo": 750000
+                              }
+                            }
+                          ]
                         }
                       },
                       {
