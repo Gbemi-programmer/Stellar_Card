@@ -117,6 +117,19 @@ renouncing a role that isn't held) do not emit events when no state changed,
 so every event is a real state transition. The full topic/data layout of each
 event is documented at the top of `src/lib.rs`.
 
+## Access control & storage
+
+- `pause` needs the `Operator` role or higher; `rescue_tokens` and
+  `set_withdraw_limits` need `Admin`. The stored admin (`admin()`) always
+  qualifies, even after renouncing its own role entry.
+- `transfer_admin` moves the `Admin` role along with the admin address, so the
+  outgoing admin can no longer use role-gated entrypoints (it also emits
+  `role_revoked` / `role_granted` before `admin_transferred`).
+- Instance storage, which every call loads, stays bounded: `Paused` is only
+  stored while paused, the `rescue_tokens` daily total is a single reused
+  slot, and the reentrancy guard entry is removed after each call. The full
+  storage layout is documented at the top of `src/lib.rs`.
+
 ## Testing & Verification
 
 ```bash

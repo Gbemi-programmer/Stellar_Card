@@ -216,11 +216,24 @@ fn admin_handover_moves_control_to_the_new_admin() {
     let new_admin = Address::generate(&net.env);
 
     client.transfer_admin(&new_admin);
-    assert_eq!(net.event_names(), [net.sym("admin_transferred")]);
+    assert_eq!(
+        net.event_names(),
+        [
+            net.sym("role_revoked"),
+            net.sym("role_granted"),
+            net.sym("admin_transferred"),
+        ]
+    );
     assert_eq!(client.admin(), new_admin);
 
+    // The Admin role moved with the handover (Issue #394 - Part 2): the old
+    // admin can no longer use role-gated entrypoints either.
+    assert_eq!(client.get_role(&net.admin), None);
+    assert_eq!(client.get_role(&new_admin), Some(Role::Admin));
+    assert!(client.try_pause(&net.admin).is_err());
+
     // Admin-only actions now require the new admin's signature.
-    client.pause(&net.admin); // the old admin still holds the Admin role
+    client.pause(&new_admin);
     let unpause_as_old_admin = client
         .mock_auths(&[MockAuth {
             address: &net.admin,
