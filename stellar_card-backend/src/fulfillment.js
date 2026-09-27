@@ -45,8 +45,9 @@ function redactCardFields(payload) {
   };
 }
 
-// Retry delays: attempt 1 → 30s, attempt 2 → 5m, attempt 3 → 30m
-const WEBHOOK_RETRY_DELAYS_MS = [30_000, 5 * 60_000, 30 * 60_000];
+// Retry delays: exponential backoff with base 30s and multiplier 2
+// attempt 1 → 30s, attempt 2 → 60s, attempt 3 → 120s
+const WEBHOOK_RETRY_DELAYS_MS = [30_000, 60_000, 120_000];
 const MAX_WEBHOOK_ATTEMPTS = 3;
 
 // Audit A-7: per-origin circuit breaker. If a webhook origin fails
