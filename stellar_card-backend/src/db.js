@@ -72,7 +72,7 @@ db.exec(`
   );
 
   -- Webhook delivery queue: failed webhook attempts are persisted here for retry.
-  -- Max 3 attempts with exponential backoff (30s, 5m, 30m).
+  -- Max 3 attempts with exponential backoff (30s, 60s, 120s).
   CREATE TABLE IF NOT EXISTS webhook_queue (
     id           TEXT PRIMARY KEY,
     url          TEXT NOT NULL,
