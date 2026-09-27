@@ -29,7 +29,7 @@
 
 require('../helpers/env');
 
-const { describe, it, beforeEach } = require('node:test');
+const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const { v4: uuidv4 } = require('uuid');
 const { db, resetDb, createTestKey } = require('../helpers/app');
@@ -38,6 +38,9 @@ const {
   handlePayment,
   _parseStrictPositiveStroops,
   _safeErrorMessage,
+  _setVccClient,
+  _setFulfillment,
+  _resetTestHooks,
 } = require('../../src/payment-handler');
 
 // ── F1-payment-handler: safeErrorMessage ────────────────────────────────────
@@ -524,5 +527,611 @@ describe('F7-payment-handler: unmatched-payment routing', () => {
     });
     assert.equal(getOrder(orderId).status, 'pending_payment');
     assert.equal(findUnmatched('TX_UNKNOWN_ASSET').reason, 'unknown_asset');
+  });
+});
+
+// ── Part 4: fulfillment-pipeline unit tests ────────────────────────────────
+//
+// Parts 1–3 covered the pure helpers (F1/F2/F3) and the unmatched-payment
+// routing branches (F7) at unit level, leaving the post-claim fulfillment
+// pipeline (getInvoice → payCtxOrder → notifyPaid), ambiguous-outcome
+// parking, failure → refund routing, and the duplicate-claim race to the
+// e2e integration suite with its fake VCC HTTP server. Part 4 closes that
+// gap with isolated unit tests: the _setVccClient / _setFulfillment
+// injection hooks (src/payment-handler.js, following the
+// src/mpp/verify.js::_setRpcServer precedent) stub the VCC boundary, and
+// the xlmSender module object is mutated at runtime (the same pattern
+// e2e-cards402-vcc.test.js relies on) to stub payCtxOrder. No network,
+// no HTTP server — every external call is a stub and every restoration
+// happens in afterEach so no state leaks between cases.
+
+const xlmSender = require('../../src/payments/xlm-sender');
+
+const PART4_HASH = 'a'.repeat(64);
+const PART4_PAYMENT_URL = `web+stellar:pay?destination=G${'A'.repeat(55)}&amount=10&memo=t`;
+// Saved once at load; every Part 4 describe restores it in afterEach.
+const _realPayCtxOrder = xlmSender.payCtxOrder;
+
+/** Install success stubs for the whole pipeline; returns call recorders. */
+function stubSuccessPipeline({ payHash = PART4_HASH } = {}) {
+  const notifyCalls = [];
+  _setVccClient({
+    getInvoice: async () => ({
+      vccJobId: 'job_stub_1',
+      paymentUrl: PART4_PAYMENT_URL,
+      callbackNonce: 'nonce_stub_1',
+    }),
+    notifyPaid: async (jobId) => {
+      notifyCalls.push(jobId);
+      return { ok: true };
+    },
+  });
+  xlmSender.payCtxOrder = async () => payHash;
+  return { notifyCalls };
+}
+
+/** Install a recording refundOrQuarantine stub; returns the call list. */
+function stubRefundCapture() {
+  const calls = [];
+  _setFulfillment({
+    refundOrQuarantine: (orderId, message) => {
+      // Record synchronously on invocation — handlePayment does not
+      // await this call, so awaiting inside the stub would race the
+      // assertions.
+      calls.push({ orderId, message });
+      return Promise.resolve({ status: 'stubbed' });
+    },
+  });
+  return calls;
+}
+
+function captureBizEvents() {
+  const logger = require('../../src/lib/logger');
+  const origEvent = logger.event;
+  const events = [];
+  logger.event = (name, fields) => events.push({ name, fields });
+  return {
+    events,
+    restore() {
+      logger.event = origEvent;
+    },
+  };
+}
+
+function silenceConsoleError() {
+  const origError = console.error;
+  console.error = () => {};
+  return () => {
+    console.error = origError;
+  };
+}
+
+function seedPart4Order({
+  id = uuidv4(),
+  amountUsdc = '10.00',
+  status = 'pending_payment',
+  expectedXlmAmount = null,
+  apiKeyId,
+} = {}) {
+  db.prepare(
+    `INSERT INTO orders (id, status, amount_usdc, payment_asset, api_key_id, expected_xlm_amount, created_at, updated_at)
+     VALUES (?, ?, ?, 'usdc', ?, ?, datetime('now'), datetime('now'))`,
+  ).run(id, status, amountUsdc, apiKeyId, expectedXlmAmount);
+  return id;
+}
+
+// ── Part 4: happy-path fulfillment checkpoints ───────────────────────────
+
+describe('Part 4: happy-path fulfillment checkpoints', () => {
+  let apiKeyId;
+  let restoreConsole;
+  let pipeline;
+
+  beforeEach(async () => {
+    resetDb();
+    const key = await createTestKey({ label: 'part4-happy' });
+    apiKeyId = key.id;
+    restoreConsole = silenceConsoleError();
+    pipeline = stubSuccessPipeline();
+  });
+
+  afterEach(() => {
+    restoreConsole();
+    xlmSender.payCtxOrder = _realPayCtxOrder;
+    _resetTestHooks();
+  });
+
+  it('persists every checkpoint on a successful USDC payment', async () => {
+    const orderId = seedPart4Order({ amountUsdc: '10.00', apiKeyId });
+    await handlePayment({
+      txid: 'TX_PART4_HAPPY',
+      paymentAsset: 'usdc_soroban',
+      amountUsdc: '10.00',
+      amountXlm: null,
+      senderAddress: 'GSENDER',
+      orderId,
+    });
+
+    const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get(orderId);
+    assert.equal(order.status, 'ordering', 'successful payment claims the order');
+    assert.equal(order.vcc_job_id, 'job_stub_1');
+    assert.equal(order.callback_nonce, 'nonce_stub_1');
+    // CTX invoice XLM amount extracted from the stub payment URL.
+    assert.equal(order.ctx_invoice_xlm, '10');
+    assert.equal(order.ctx_stellar_txid, PART4_HASH);
+    assert.ok(order.xlm_sent_at, 'xlm_sent_at must be set after payCtxOrder');
+    assert.ok(order.vcc_notified_at, 'vcc_notified_at must be set after notifyPaid');
+    assert.deepEqual(pipeline.notifyCalls, ['job_stub_1']);
+    const unmatched = db
+      .prepare(`SELECT COUNT(*) AS n FROM unmatched_payments WHERE stellar_txid = ?`)
+      .get('TX_PART4_HAPPY');
+    assert.equal(unmatched.n, 0, 'happy path must not touch unmatched_payments');
+  });
+
+  it('persists excess_usdc on overpayment and still completes fulfillment', async () => {
+    const orderId = seedPart4Order({ amountUsdc: '10.00', apiKeyId });
+    await handlePayment({
+      txid: 'TX_PART4_EXCESS',
+      paymentAsset: 'usdc_soroban',
+      amountUsdc: '11.50',
+      amountXlm: null,
+      senderAddress: 'GSENDER',
+      orderId,
+    });
+
+    const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get(orderId);
+    assert.equal(order.status, 'ordering', 'overpayment is accepted, not rejected');
+    assert.equal(order.excess_usdc, '1.5000000');
+    assert.equal(order.vcc_job_id, 'job_stub_1');
+    assert.equal(order.ctx_stellar_txid, PART4_HASH);
+    assert.deepEqual(pipeline.notifyCalls, ['job_stub_1']);
+  });
+
+  it('claims an exact XLM payment and forwards the xlm branch to payCtxOrder', async () => {
+    const orderId = seedPart4Order({ amountUsdc: '10.00', expectedXlmAmount: '100', apiKeyId });
+    let payArgs = null;
+    xlmSender.payCtxOrder = async (...args) => {
+      payArgs = args;
+      return PART4_HASH;
+    };
+    await handlePayment({
+      txid: 'TX_PART4_XLM',
+      paymentAsset: 'xlm_soroban',
+      amountUsdc: null,
+      amountXlm: '100',
+      senderAddress: 'GSENDER',
+      orderId,
+    });
+
+    assert.ok(payArgs, 'payCtxOrder must be called on the XLM branch');
+    assert.equal(payArgs[1].paymentAsset, 'xlm_soroban');
+    const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get(orderId);
+    assert.equal(order.status, 'ordering');
+    assert.equal(order.ctx_stellar_txid, PART4_HASH);
+    assert.deepEqual(pipeline.notifyCalls, ['job_stub_1']);
+  });
+});
+
+// ── Part 4: corrupt-order bizEvent ───────────────────────────────────────
+
+describe('Part 4: corrupt_order_amount bizEvent', () => {
+  let apiKeyId;
+  let restoreConsole;
+  let biz;
+
+  beforeEach(async () => {
+    resetDb();
+    const key = await createTestKey({ label: 'part4-corrupt-event' });
+    apiKeyId = key.id;
+    restoreConsole = silenceConsoleError();
+    biz = captureBizEvents();
+  });
+
+  afterEach(() => {
+    restoreConsole();
+    biz.restore();
+    _resetTestHooks();
+  });
+
+  it("emits payment.corrupt_order_amount with the offending column", async () => {
+    const orderId = seedPart4Order({ amountUsdc: '', apiKeyId });
+    await handlePayment({
+      txid: 'TX_PART4_CORRUPT_EVT',
+      paymentAsset: 'usdc_soroban',
+      amountUsdc: '10.00',
+      amountXlm: null,
+      senderAddress: 'GSENDER',
+      orderId,
+    });
+
+    const evt = biz.events.find((e) => e.name === 'payment.corrupt_order_amount');
+    assert.ok(evt, 'expected payment.corrupt_order_amount bizEvent');
+    assert.equal(evt.fields.order_id, orderId);
+    assert.equal(evt.fields.column, 'amount_usdc');
+    assert.equal(db.prepare(`SELECT status FROM orders WHERE id = ?`).get(orderId).status,
+      'pending_payment');
+  });
+});
+
+// ── Part 4: definitive failure schedules a refund ────────────────────────
+
+describe('Part 4: definitive failure schedules a refund', () => {
+  let apiKeyId;
+  let restoreConsole;
+  let refundCalls;
+
+  beforeEach(async () => {
+    resetDb();
+    const key = await createTestKey({ label: 'part4-failure' });
+    apiKeyId = key.id;
+    restoreConsole = silenceConsoleError();
+    _setVccClient({
+      getInvoice: async () => {
+        throw new Error('vcc invoice down');
+      },
+    });
+    xlmSender.payCtxOrder = async () => PART4_HASH;
+    refundCalls = stubRefundCapture();
+  });
+
+  afterEach(() => {
+    restoreConsole();
+    xlmSender.payCtxOrder = _realPayCtxOrder;
+    _resetTestHooks();
+  });
+
+  it('marks failed and calls refundOrQuarantine when getInvoice throws', async () => {
+    const orderId = seedPart4Order({ amountUsdc: '10.00', apiKeyId });
+    await handlePayment({
+      txid: 'TX_PART4_FAIL',
+      paymentAsset: 'usdc_soroban',
+      amountUsdc: '10.00',
+      amountXlm: null,
+      senderAddress: 'GSENDER',
+      orderId,
+    });
+
+    const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get(orderId);
+    assert.equal(order.status, 'failed');
+    assert.ok(typeof order.error === 'string' && order.error.length > 0);
+    assert.equal(order.ctx_stellar_txid, null, 'no outbound CTX tx happened');
+    assert.equal(refundCalls.length, 1, 'refund must be scheduled exactly once');
+    assert.equal(refundCalls[0].orderId, orderId);
+    assert.equal(typeof refundCalls[0].message, 'string');
+  });
+
+  it('falls through to the refund path when ambiguous markers carry no txHash', async () => {
+    const orderId = seedPart4Order({ amountUsdc: '10.00', apiKeyId });
+    _setVccClient({
+      getInvoice: async () => ({
+        vccJobId: 'job_stub_1',
+        paymentUrl: PART4_PAYMENT_URL,
+        callbackNonce: 'nonce_stub_1',
+      }),
+      notifyPaid: async () => ({ ok: true }),
+    });
+    xlmSender.payCtxOrder = async () => {
+      // stellarStatus set but no txHash — outcome is definitively
+      // failed (nothing may have landed), so auto-refund applies.
+      const err = new Error('horizon timeout with no hash');
+      err.stellarStatus = 'unknown';
+      throw err;
+    };
+    await handlePayment({
+      txid: 'TX_PART4_NOHASH',
+      paymentAsset: 'usdc_soroban',
+      amountUsdc: '10.00',
+      amountXlm: null,
+      senderAddress: 'GSENDER',
+      orderId,
+    });
+
+    const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get(orderId);
+    assert.equal(order.status, 'failed');
+    assert.equal(order.ctx_stellar_txid, null);
+    assert.equal(refundCalls.length, 1, 'hashless failure must auto-refund');
+  });
+
+  it('follows the refund path for a plain non-ambiguous payCtxOrder error', async () => {
+    const orderId = seedPart4Order({ amountUsdc: '10.00', apiKeyId });
+    _setVccClient({
+      getInvoice: async () => ({
+        vccJobId: 'job_stub_1',
+        paymentUrl: PART4_PAYMENT_URL,
+        callbackNonce: 'nonce_stub_1',
+      }),
+      notifyPaid: async () => ({ ok: true }),
+    });
+    xlmSender.payCtxOrder = async () => {
+      throw new Error('opaque horizon error with no markers');
+    };
+    await handlePayment({
+      txid: 'TX_PART4_PLAIN',
+      paymentAsset: 'usdc_soroban',
+      amountUsdc: '10.00',
+      amountXlm: null,
+      senderAddress: 'GSENDER',
+      orderId,
+    });
+
+    const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get(orderId);
+    assert.equal(order.status, 'failed');
+    assert.equal(refundCalls.length, 1);
+  });
+});
+
+// ── Part 4: ambiguous CTX payment parks the order (unit level) ───────────
+
+describe('Part 4: ambiguous CTX payment parks the order', () => {
+  let apiKeyId;
+  let restoreConsole;
+  let refundCalls;
+
+  beforeEach(async () => {
+    resetDb();
+    const key = await createTestKey({ label: 'part4-ambiguous' });
+    apiKeyId = key.id;
+    restoreConsole = silenceConsoleError();
+    _setVccClient({
+      getInvoice: async () => ({
+        vccJobId: 'job_stub_1',
+        paymentUrl: PART4_PAYMENT_URL,
+        callbackNonce: 'nonce_stub_1',
+      }),
+      notifyPaid: async () => ({ ok: true }),
+    });
+    refundCalls = stubRefundCapture();
+  });
+
+  afterEach(() => {
+    restoreConsole();
+    xlmSender.payCtxOrder = _realPayCtxOrder;
+    _resetTestHooks();
+  });
+
+  function ambiguousError(stellarStatus, txHash) {
+    const err = new Error(`submit network error ${stellarStatus}`);
+    err.stellarStatus = stellarStatus;
+    err.txHash = txHash;
+    return err;
+  }
+
+  it("parks on stellarStatus=unknown with NO auto-refund", async () => {
+    const hash = 'b'.repeat(64);
+    xlmSender.payCtxOrder = async () => {
+      throw ambiguousError('unknown', hash);
+    };
+    const orderId = seedPart4Order({ amountUsdc: '10.00', apiKeyId });
+    await handlePayment({
+      txid: 'TX_PART4_AMB_UNKNOWN',
+      paymentAsset: 'usdc_soroban',
+      amountUsdc: '10.00',
+      amountXlm: null,
+      senderAddress: 'GSENDER',
+      orderId,
+    });
+
+    const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get(orderId);
+    assert.equal(order.status, 'failed', 'order must be parked as failed');
+    assert.equal(order.ctx_stellar_txid, hash, 'hash must be captured for ops review');
+    assert.equal(order.xlm_sent_at, null, 'xlm_sent_at stays null — outcome unsure');
+    assert.equal(order.refund_stellar_txid, null, 'must NOT auto-refund on ambiguous outcome');
+    assert.match(order.error, /ambiguous on-chain|operator/i);
+    assert.doesNotMatch(order.error, /refunded automatically/i);
+    assert.equal(refundCalls.length, 0, 'refundOrQuarantine must not fire on this path');
+    // getInvoice ran before payCtxOrder, so the invoice checkpoint exists.
+    assert.equal(order.vcc_job_id, 'job_stub_1');
+  });
+
+  it('parks on stellarStatus=applied_failed with NO auto-refund', async () => {
+    const hash = 'c'.repeat(64);
+    xlmSender.payCtxOrder = async () => {
+      throw ambiguousError('applied_failed', hash);
+    };
+    const orderId = seedPart4Order({ amountUsdc: '10.00', apiKeyId });
+    await handlePayment({
+      txid: 'TX_PART4_AMB_FAILED',
+      paymentAsset: 'usdc_soroban',
+      amountUsdc: '10.00',
+      amountXlm: null,
+      senderAddress: 'GSENDER',
+      orderId,
+    });
+
+    const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get(orderId);
+    assert.equal(order.status, 'failed');
+    assert.equal(order.ctx_stellar_txid, hash);
+    assert.equal(order.refund_stellar_txid, null);
+    assert.equal(refundCalls.length, 0);
+  });
+});
+
+// ── Part 4: duplicate-claim race branch ──────────────────────────────────
+//
+// The atomic `UPDATE ... WHERE status = 'pending_payment'` is the guard:
+// when two events race, the loser sees changes === 0 and must record
+// duplicate_payment instead of re-running fulfillment. The e2e suite
+// covers the sequential double-event case (which funnels through the
+// order_status_* re-read); this test forces the changes === 0 branch
+// itself by wrapping db.prepare for the claim statement only.
+
+describe('Part 4: duplicate-claim race branch', () => {
+  let apiKeyId;
+  let restoreConsole;
+  let invoiceCalls;
+
+  beforeEach(async () => {
+    resetDb();
+    const key = await createTestKey({ label: 'part4-duplicate' });
+    apiKeyId = key.id;
+    restoreConsole = silenceConsoleError();
+    invoiceCalls = 0;
+    _setVccClient({
+      getInvoice: async () => {
+        invoiceCalls++;
+        return {
+          vccJobId: 'job_stub_1',
+          paymentUrl: PART4_PAYMENT_URL,
+          callbackNonce: 'nonce_stub_1',
+        };
+      },
+      notifyPaid: async () => ({ ok: true }),
+    });
+    xlmSender.payCtxOrder = async () => PART4_HASH;
+    stubRefundCapture();
+  });
+
+  afterEach(() => {
+    restoreConsole();
+    xlmSender.payCtxOrder = _realPayCtxOrder;
+    _resetTestHooks();
+  });
+
+  it('records duplicate_payment and never starts fulfillment when the claim loses the race', async () => {
+    const orderId = seedPart4Order({ amountUsdc: '10.00', apiKeyId });
+    const realPrepare = db.prepare;
+    let blockClaim = true;
+    db.prepare = function (sql, ...rest) {
+      const stmt = realPrepare.call(db, sql, ...rest);
+      if (blockClaim && /UPDATE orders\s+SET status = 'ordering'/.test(sql)) {
+        return {
+          run: () => {
+            blockClaim = false;
+            return { changes: 0 };
+          },
+        };
+      }
+      return stmt;
+    };
+    try {
+      await handlePayment({
+        txid: 'TX_PART4_DUPE_RACE',
+        paymentAsset: 'usdc_soroban',
+        amountUsdc: '10.00',
+        amountXlm: null,
+        senderAddress: 'GSENDER',
+        orderId,
+      });
+    } finally {
+      db.prepare = realPrepare;
+    }
+
+    assert.equal(
+      db.prepare(`SELECT status FROM orders WHERE id = ?`).get(orderId).status,
+      'pending_payment',
+      'losing the claim race must leave the order untouched',
+    );
+    const unmatched = db
+      .prepare(`SELECT * FROM unmatched_payments WHERE stellar_txid = ?`)
+      .get('TX_PART4_DUPE_RACE');
+    assert.ok(unmatched, 'expected an unmatched_payments row');
+    assert.equal(unmatched.reason, 'duplicate_payment');
+    assert.equal(invoiceCalls, 0, 'fulfillment must not start after a lost claim');
+  });
+});
+
+// ── Part 4: stroop-precision amount boundaries ───────────────────────────
+//
+// compareDecimal / toStroops are exercised behaviorally through
+// handlePayment: exact 7-decimal equivalence claims, a single stroop
+// over/under settles the over/underpaid routing, and sub-stroop dust
+// (8th decimal) truncates rather than tipping the comparison.
+
+describe('Part 4: stroop-precision amount boundaries', () => {
+  let apiKeyId;
+  let restoreConsole;
+  let biz;
+
+  beforeEach(async () => {
+    resetDb();
+    const key = await createTestKey({ label: 'part4-precision' });
+    apiKeyId = key.id;
+    restoreConsole = silenceConsoleError();
+    biz = captureBizEvents();
+    stubSuccessPipeline();
+    stubRefundCapture();
+  });
+
+  afterEach(() => {
+    restoreConsole();
+    biz.restore();
+    xlmSender.payCtxOrder = _realPayCtxOrder;
+    _resetTestHooks();
+  });
+
+  async function payExactBoundary(orderId, amountUsdc, txid) {
+    await handlePayment({
+      txid,
+      paymentAsset: 'usdc_soroban',
+      amountUsdc,
+      amountXlm: null,
+      senderAddress: 'GSENDER',
+      orderId,
+    });
+  }
+
+  it("claims on trailing-zero 7-decimal equivalence without an overpaid event", async () => {
+    const orderId = seedPart4Order({ amountUsdc: '10.00', apiKeyId });
+    await payExactBoundary(orderId, '10.0000000', 'TX_PART4_PREC_EXACT');
+
+    assert.equal(
+      db.prepare(`SELECT status FROM orders WHERE id = ?`).get(orderId).status,
+      'ordering',
+    );
+    assert.equal(
+      biz.events.filter((e) => e.name === 'payment.usdc_overpaid').length,
+      0,
+      'exact 7dp match must not emit overpaid',
+    );
+  });
+
+  it('treats one stroop over as overpayment with exact excess', async () => {
+    const orderId = seedPart4Order({ amountUsdc: '10.00', apiKeyId });
+    await payExactBoundary(orderId, '10.0000001', 'TX_PART4_PREC_OVER');
+
+    assert.equal(
+      db.prepare(`SELECT status FROM orders WHERE id = ?`).get(orderId).status,
+      'ordering',
+    );
+    const overpaid = biz.events.find((e) => e.name === 'payment.usdc_overpaid');
+    assert.ok(overpaid, 'expected payment.usdc_overpaid bizEvent');
+    assert.equal(overpaid.fields.excess_usdc, '0.0000001');
+    assert.equal(
+      db.prepare(`SELECT excess_usdc FROM orders WHERE id = ?`).get(orderId).excess_usdc,
+      '0.0000001',
+    );
+  });
+
+  it('treats one stroop under as underpayment', async () => {
+    const orderId = seedPart4Order({ amountUsdc: '10.00', apiKeyId });
+    await payExactBoundary(orderId, '9.9999999', 'TX_PART4_PREC_UNDER');
+
+    assert.equal(
+      db.prepare(`SELECT status FROM orders WHERE id = ?`).get(orderId).status,
+      'pending_payment',
+    );
+    assert.equal(
+      db.prepare(`SELECT reason FROM unmatched_payments WHERE stellar_txid = ?`).get(
+        'TX_PART4_PREC_UNDER',
+      ).reason,
+      'underpaid_usdc',
+    );
+  });
+
+  it('truncates sub-stroop dust instead of tipping the comparison', async () => {
+    // 8th-decimal dust is below Stellar stroop precision and is cut by
+    // toStroops — this stays an exact match, not an overpayment.
+    const orderId = seedPart4Order({ amountUsdc: '10.00', apiKeyId });
+    await payExactBoundary(orderId, '10.00000009', 'TX_PART4_PREC_DUST');
+
+    assert.equal(
+      db.prepare(`SELECT status FROM orders WHERE id = ?`).get(orderId).status,
+      'ordering',
+    );
+    assert.equal(
+      biz.events.filter((e) => e.name === 'payment.usdc_overpaid').length,
+      0,
+      'sub-stroop dust must not emit overpaid',
+    );
   });
 });

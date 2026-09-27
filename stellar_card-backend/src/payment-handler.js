@@ -17,13 +17,13 @@
 
 const { v4: uuidv4 } = require('uuid');
 const db = require('./db');
-const { getInvoice, notifyPaid } = require('./vcc-client');
+const vccClient = require('./vcc-client');
 // Import as module object so tests can monkey-patch xlmSender.payCtxOrder
 // at runtime. Destructuring captures the reference at load time and
 // prevents tests from exercising the ambiguous-outcome branch without
 // a full patchCache refactor. Same pattern applied in jobs.js.
 const xlmSender = require('./payments/xlm-sender');
-const { refundOrQuarantine } = require('./fulfillment');
+const fulfillment = require('./fulfillment');
 // Deferred logger reference so tests can monkey-patch `logger.event`
 // at runtime without having to patchCache before module load. Same
 // pattern used by src/middleware/requireCardReveal.js after the
@@ -31,6 +31,48 @@ const { refundOrQuarantine } = require('./fulfillment');
 // object (`logger.event(...)`) rather than a destructured local.
 const logger = require('./lib/logger');
 const { publicMessage } = require('./lib/sanitize-error');
+
+// Test hooks (Part 4) — dependency injection for unit tests.
+//
+// getInvoice / notifyPaid / refundOrQuarantine used to be destructured
+// at module load, which captured the function references and made them
+// invisible to require.cache stubbing (the test file documents this
+// limitation on its F2 regression guard). xlmSender.payCtxOrder never
+// had this problem because it is invoked through the module object.
+// These setters follow the src/mpp/verify.js::_setRpcServer precedent:
+// unit tests inject stubs, exercise handlePayment in isolation (no fake
+// VCC HTTP server needed), and restore production implementations via
+// _resetTestHooks. Production call sites below always go through the
+// `let` bindings, never the module objects directly.
+let _getInvoice = vccClient.getInvoice;
+let _notifyPaid = vccClient.notifyPaid;
+let _refundOrQuarantine = fulfillment.refundOrQuarantine;
+
+/**
+ * Inject stub vcc-client functions for tests. Omitted keys keep their
+ * current binding. Not for production use.
+ * @param {{getInvoice?: Function, notifyPaid?: Function}} [stubs]
+ */
+function _setVccClient(stubs = {}) {
+  if (stubs.getInvoice !== undefined) _getInvoice = stubs.getInvoice;
+  if (stubs.notifyPaid !== undefined) _notifyPaid = stubs.notifyPaid;
+}
+
+/**
+ * Inject a stub fulfillment.refundOrQuarantine for tests. Omitted keys
+ * keep their current binding. Not for production use.
+ * @param {{refundOrQuarantine?: Function}} [stubs]
+ */
+function _setFulfillment(stubs = {}) {
+  if (stubs.refundOrQuarantine !== undefined) _refundOrQuarantine = stubs.refundOrQuarantine;
+}
+
+/** Restore the production vcc-client / fulfillment implementations. */
+function _resetTestHooks() {
+  _getInvoice = vccClient.getInvoice;
+  _notifyPaid = vccClient.notifyPaid;
+  _refundOrQuarantine = fulfillment.refundOrQuarantine;
+}
 
 /**
  * Compare two decimal-string amounts without losing precision.
@@ -369,7 +411,7 @@ async function handlePayment({
   }
 
   try {
-    const { vccJobId, paymentUrl, callbackNonce } = await getInvoice(
+    const { vccJobId, paymentUrl, callbackNonce } = await _getInvoice(
       orderId,
       order.amount_usdc,
       order.request_id,
@@ -475,7 +517,7 @@ async function handlePayment({
       `UPDATE orders SET xlm_sent_at = ?, ctx_stellar_txid = ?, updated_at = ? WHERE id = ?`,
     ).run(new Date().toISOString(), ctxTxHash || null, new Date().toISOString(), orderId);
 
-    await notifyPaid(vccJobId);
+    await _notifyPaid(vccJobId);
     db.prepare(`UPDATE orders SET vcc_notified_at = ?, updated_at = ? WHERE id = ?`).run(
       new Date().toISOString(),
       new Date().toISOString(),
@@ -503,7 +545,7 @@ async function handlePayment({
       new Date().toISOString(),
       orderId,
     );
-    refundOrQuarantine(orderId, safePublicMessage).catch((e) =>
+    _refundOrQuarantine(orderId, safePublicMessage).catch((e) =>
       console.error(`[payment] refund error for ${orderId.slice(0, 8)}: ${safeErrorMessage(e)}`),
     );
   }
@@ -514,4 +556,8 @@ module.exports = {
   // Test-only exports for the 2026-04-15 audit hardening.
   _parseStrictPositiveStroops: parseStrictPositiveStroops,
   _safeErrorMessage: safeErrorMessage,
+  // Test-only dependency-injection hooks (Part 4). See _setVccClient.
+  _setVccClient,
+  _setFulfillment,
+  _resetTestHooks,
 };
