@@ -50,6 +50,37 @@ function redactCardFields(payload) {
 const WEBHOOK_RETRY_DELAYS_MS = [30_000, 60_000, 120_000];
 const MAX_WEBHOOK_ATTEMPTS = 3;
 
+/**
+ * Calculates exponential backoff delay for webhook retries.
+ *
+ * @param {number} attempt - Current attempt count (1-indexed).
+ * @param {{ baseDelayMs?: number, factor?: number, maxDelayMs?: number }} [options]
+ * @returns {number} Delay in milliseconds.
+ */
+function calculateWebhookBackoff(attempt, options = {}) {
+  const baseDelayMs = options.baseDelayMs ?? 30_000;
+  const factor = options.factor ?? 2;
+  const maxDelayMs = options.maxDelayMs ?? 3_600_000; // 1 hour cap
+
+  if (attempt < 1) return baseDelayMs;
+  const delay = baseDelayMs * Math.pow(factor, attempt - 1);
+  return Math.min(delay, maxDelayMs);
+}
+
+/**
+ * Get retry delay in milliseconds for a specific attempt number.
+ *
+ * @param {number} attempt - Attempt index (0-indexed or 1-indexed depending on usage)
+ * @returns {number}
+ */
+function getWebhookRetryDelay(attempt) {
+  const index = typeof attempt === 'number' && attempt >= 0 ? attempt : 0;
+  if (index < WEBHOOK_RETRY_DELAYS_MS.length) {
+    return WEBHOOK_RETRY_DELAYS_MS[index];
+  }
+  return calculateWebhookBackoff(index + 1);
+}
+
 // Audit A-7: per-origin circuit breaker. If a webhook origin fails
 // `CB_THRESHOLD` times inside `CB_WINDOW_MS`, subsequent calls to that
 // origin fail fast for `CB_COOLDOWN_MS` instead of eating the 10s fetch
@@ -590,6 +621,8 @@ module.exports = {
   enqueueWebhook,
   fireWebhook,
   redactCardFields,
+  calculateWebhookBackoff,
+  getWebhookRetryDelay,
   WEBHOOK_RETRY_DELAYS_MS,
   MAX_WEBHOOK_ATTEMPTS,
   // Test-only exports for the 2026-04-15 audit hardening.

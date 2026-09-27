@@ -118,6 +118,8 @@ describe('requireInternal — domain allow', () => {
     // domain is allowed, which it is not, and the case-folding property
     // this test is named for was never actually verified.
     const mw = freshMiddleware();
+    const { nextCalled } = runMiddleware(mw, { id: 'u1', email: 'OPS@STELLAR_CARD.COM' });
+    assert.equal(nextCalled, true);
     for (const email of ['OPS@STELLAR_CARD.COM', 'Ops@Stellar_Card.CoM', 'ops@stellar_card.com']) {
       const { nextCalled, statusCode } = runMiddleware(mw, { id: 'u1', email });
       assert.equal(nextCalled, true, email);

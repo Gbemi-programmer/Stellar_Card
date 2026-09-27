@@ -113,8 +113,9 @@ const server = new Horizon.Server(HORIZON_URL);
 //      from must-not-retry without parsing error strings.
 async function submitWithRetry(buildTx, keypair, maxAttempts = 3) {
   let lastErr;
+  const publicKey = keypair.publicKey();
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const account = await server.loadAccount(keypair.publicKey());
+    const account = await server.loadAccount(publicKey);
     const tx = buildTx(account);
     tx.sign(keypair);
     // Compute the envelope hash BEFORE submission so we can look it up on
@@ -122,13 +123,52 @@ async function submitWithRetry(buildTx, keypair, maxAttempts = 3) {
     // Buffer; Horizon's /transactions/{hash} endpoint takes hex.
     const hashHex = tx.hash().toString('hex');
 
+    log('info', 'wallet.transaction.attempt', {
+      public_key: maskStellarAddress(publicKey),
+      tx_hash: hashHex,
+      attempt,
+      max_attempts: maxAttempts,
+    });
+    bizEvent('wallet.tx_initiated', {
+      public_key: maskStellarAddress(publicKey),
+      tx_hash: hashHex,
+      attempt,
+      max_attempts: maxAttempts,
+    });
+
     try {
       const result = await server.submitTransaction(tx);
-      return result.hash;
+      const finalHash = result.hash || hashHex;
+      log('info', 'wallet.transaction.success', {
+        public_key: maskStellarAddress(publicKey),
+        tx_hash: finalHash,
+        attempt,
+      });
+      bizEvent('wallet.tx_success', {
+        public_key: maskStellarAddress(publicKey),
+        tx_hash: finalHash,
+        attempt,
+      });
+      return finalHash;
     } catch (err) {
       lastErr = err;
       const resultCodes = err?.response?.data?.extras?.result_codes;
       const txCode = resultCodes?.transaction;
+
+      log('error', 'wallet.transaction.failed', {
+        public_key: maskStellarAddress(publicKey),
+        tx_hash: hashHex,
+        attempt,
+        error: err instanceof Error ? err.message : String(err),
+        tx_code: txCode || null,
+      });
+      bizEvent('wallet.tx_failed', {
+        public_key: maskStellarAddress(publicKey),
+        tx_hash: hashHex,
+        attempt,
+        error: err instanceof Error ? err.message : String(err),
+        tx_code: txCode || null,
+      });
 
       // tx_bad_seq: definitive rejection; safe to reload + retry.
       if (txCode === 'tx_bad_seq' && attempt < maxAttempts) {
@@ -144,6 +184,14 @@ async function submitWithRetry(buildTx, keypair, maxAttempts = 3) {
       const resolution = await resolveNetworkErrorOutcome(hashHex);
       if (resolution.landed) {
         // The tx did make it to a ledger during the lost-response window.
+        log('info', 'wallet.transaction.recovered', {
+          public_key: maskStellarAddress(publicKey),
+          tx_hash: hashHex,
+        });
+        bizEvent('wallet.tx_recovered', {
+          public_key: maskStellarAddress(publicKey),
+          tx_hash: hashHex,
+        });
         return hashHex;
       }
       // Re-throw with a clearer message and a machine-readable marker so
