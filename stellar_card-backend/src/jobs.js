@@ -18,6 +18,62 @@ const vccClient = require('./vcc-client');
 // untestable without a full patchCache refactor.
 const xlmSender = require('./payments/xlm-sender');
 const { recordDecision } = require('./policy');
+const sentryConfig = require('./lib/sentry-config');
+
+// Test hooks + scheduler error reporting (Part 4 of the Sentry
+// monitoring rollout).
+//
+// Background jobs run outside any Express request scope, so the
+// request/error middleware pair in app.js never sees them and index.js
+// only captures process-level uncaught exceptions and unhandled
+// rejections. A sub-job that throws inside _runSubJob's isolating
+// try/catch therefore stayed invisible in Sentry — ops only had the
+// `jobs.subjob_failed` bizEvent. reportSchedulerError closes that gap
+// by forwarding the original error object (with its stack) plus a
+// `subjob` tag to Sentry on every scheduler failure sink below.
+//
+// _reportError defaults to a thin delegate over
+// sentryConfig.captureException, which is itself a no-op until
+// initSentry() succeeds — so this costs one function call per failure
+// when Sentry is off and needs no NODE_ENV branching at the call
+// sites. Tests inject a recorder via _setErrorReporter (same precedent
+// as src/mpp/verify.js::_setRpcServer): initializing the real SDK is a
+// process-global, one-way side effect the suite deliberately never
+// performs (see test/unit/sentry-config.test.js), so the production
+// binding is unobservable in tests without the hook.
+/** @type {(err: unknown, ctx: { tags?: Record<string, string>, extra?: Record<string, unknown> }) => unknown} */
+let _reportError = (err, ctx) => sentryConfig.captureException(err, ctx);
+
+/**
+ * Inject a stub error reporter for tests. Not for production use.
+ * @param {(err: unknown, ctx: { tags?: Record<string, string>, extra?: Record<string, unknown> }) => unknown} fn
+ */
+function _setErrorReporter(fn) {
+  _reportError = fn;
+}
+
+/** Restore the production Sentry reporter. */
+function _resetErrorReporter() {
+  _reportError = (err, ctx) => sentryConfig.captureException(err, ctx);
+}
+
+/**
+ * Forward a scheduler failure to Sentry. Never throws — reporting must
+ * never crash the job loop, so callers can invoke this unconditionally
+ * next to their existing console.error / bizEvent handling.
+ * @param {unknown} err
+ * @param {string} subjob
+ */
+function reportSchedulerError(err, subjob) {
+  try {
+    _reportError(err, {
+      tags: { area: 'scheduler', subjob },
+      extra: { message: err instanceof Error ? err.message : String(err) },
+    });
+  } catch {
+    /* observability must never crash the job loop */
+  }
+}
 
 // Reconciler timings. After RETRY_AFTER_MS we retry a stuck step. After
 // FAIL_AFTER_MS **and** vcc confirms the job isn't making progress, we hard-
@@ -1188,6 +1244,10 @@ async function _runSubJob(name, fn) {
         subjob: name,
         error: msg,
       });
+      // Part 4: mirror the failure into Sentry with the sub-job name
+      // as a tag so per-job breakage is visible, groupable, and
+      // alertable there — not just in the bizEvent stream.
+      reportSchedulerError(err, name);
     } catch {
       /* observability must never crash the job loop */
     }
@@ -1237,6 +1297,9 @@ async function checkAgentFundingStatusGuarded() {
     await checkAgentFundingStatus();
   } catch (err) {
     console.error(`[jobs] funding check error: ${err.message}`);
+    // Part 4: same Sentry mirroring as _runSubJob — the funding check
+    // runs on its own fast interval outside the sub-job chain.
+    reportSchedulerError(err, 'checkAgentFundingStatus');
   } finally {
     fundingCheckRunning = false;
   }
@@ -1272,10 +1335,10 @@ function startJobs() {
   // Discord on new firings, persists history. Cheap + bounded, runs in
   // the same process as everything else.
   const ALERT_INTERVAL_MS = parsePositiveMs('ALERT_INTERVAL_MS', 60_000);
-  evaluateAlertsForAllDashboards().catch((err) => log(`alerts startup error: ${err.message}`));
+  evaluateAlertsForAllDashboards().catch(onAlertsError('alerts startup error'));
   _jobIntervals.push(
     setInterval(
-      () => evaluateAlertsForAllDashboards().catch((err) => log(`alerts error: ${err.message}`)),
+      () => evaluateAlertsForAllDashboards().catch(onAlertsError('alerts error')),
       ALERT_INTERVAL_MS,
     ),
   );
@@ -1294,6 +1357,18 @@ function stopJobs() {
     if (t) clearInterval(t);
   }
   log('background jobs stopped');
+}
+
+// Build the rejection handler for the alert-evaluator tick (Part 4).
+// Factored out of startJobs so the Sentry mirroring is unit-testable:
+// the handler logs exactly as before and forwards the error with the
+// `evaluateAlerts` subjob tag. `prefix` is the historical log prefix
+// for the tick phase ('alerts startup error' / 'alerts error').
+function onAlertsError(prefix) {
+  return (err) => {
+    log(`${prefix}: ${err instanceof Error ? err.message : String(err)}`);
+    reportSchedulerError(err, 'evaluateAlerts');
+  };
 }
 
 // Evaluate alert rules for every dashboard. Per-dashboard to honour
@@ -1331,6 +1406,14 @@ module.exports = {
   _parsePositiveMs: parsePositiveMs,
   _resetParsePositiveMsState,
   _runSubJob,
+  // Test-only Sentry reporter hooks (Part 4). See _setErrorReporter.
+  _setErrorReporter,
+  _resetErrorReporter,
+  // Test-only scheduler-sink hooks (Part 4): the funding guard and the
+  // alert-evaluator rejection handler, so their Sentry mirroring is
+  // covered without starting real intervals.
+  _checkAgentFundingStatusGuarded: checkAgentFundingStatusGuarded,
+  _onAlertsError: onAlertsError,
   runJobs,
   checkAgentFundingStatus,
   _resetFundingHorizonOutageState,
