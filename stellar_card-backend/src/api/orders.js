@@ -15,6 +15,7 @@ const {
   jsonObject,
   boundedIntQuery,
   optionalIsoTimestamp,
+  orderIdParam,
 } = require('../lib/validate');
 const db = require('../db');
 const { isFrozen } = require('../fulfillment');
@@ -240,6 +241,19 @@ function createOrderCreateLimiter(overrideOptions = {}) {
     ...overrideOptions,
   });
 }
+// `:id` is the only path parameter on the two order read endpoints, and
+// both of them interpolate it straight into a `WHERE id = ?` bind. Length
+// is the only property worth asserting (see orderIdParam for why we can't
+// narrow further), so a 400 here is strictly better than binding an
+// attacker-sized string to prepare().
+//
+// `validate()` parses the whole target, so the field primitive has to be
+// wrapped in an object. `.passthrough()` matches every other schema here:
+// the middleware assigns its parse output back onto `req.params`, and a
+// stripping object would drop any sibling param a future sub-route adds.
+const validateOrderIdParam = validate({
+  params: z.object({ id: orderIdParam() }).passthrough(),
+});
 
 // Rate limit order creation per API key — default 60/hour, overridable per key via rate_limit_rpm.
 // req.apiKey is set by the auth middleware before this runs.
@@ -950,7 +964,7 @@ const TERMINAL_STATUSES = new Set([
 // immediately. A tight loop could hit 1000+ opens/sec, hammering
 // SQLite and socket setup without breaching any counter. Using the
 // existing 600/min poll limiter caps that axis correctly.
-router.get('/:id/stream', orderPollLimiter, (req, res) => {
+router.get('/:id/stream', orderPollLimiter, validateOrderIdParam, (req, res) => {
   const orderId = req.params.id;
   const keyId = req.apiKey.id;
 
@@ -1140,7 +1154,7 @@ router.get('/:id/stream', orderPollLimiter, (req, res) => {
 });
 
 // GET /orders/:id — poll status, returns card details when delivered
-router.get('/:id', orderPollLimiter, (req, res) => {
+router.get('/:id', orderPollLimiter, validateOrderIdParam, (req, res) => {
   const order = /** @type {any} */ (
     db
       .prepare(`SELECT * FROM orders WHERE id = ? AND api_key_id = ?`)

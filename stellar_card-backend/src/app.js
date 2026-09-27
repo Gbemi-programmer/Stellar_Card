@@ -1,6 +1,42 @@
 // @ts-check
 // Express application — importable without starting the Stellar watcher or jobs.
 // index.js is the entry point that wires everything up for production.
+//
+// This module owns ONE thing: the middleware chain that wraps every
+// request, in the order it must run. Everything that decides *which*
+// routes exist and in what order lives in src/routes/index.js. The split
+// is load-bearing and was the point of the earlier extraction:
+//
+//   src/app.js          — helmet, CORS, body parsing, request id, the
+//                         404 fallback, and the error handlers. Concerns
+//                         that apply to every request regardless of path.
+//   src/routes/index.js  — the mount table, including the order-sensitive
+//                         /v1 auth boundary.
+//
+// Issue #377 (Part 5). This file used to interleave three concerns:
+// application middleware, route mounting, and ~400 lines of inline
+// handler bodies for /status, /v1/agent/status, /v1/usage and
+// /v1/policy/check. Every one of those handlers had already been
+// extracted into src/api/ as a Router, but the inline copies were left
+// behind and mounted a second time. A bad merge (4d104a6) then spliced
+// the two worlds together and dropped a closing brace, leaving app.js
+// with a syntax error — which meant *every* test in the suite failed at
+// import, because test/helpers/app.js requires this file. Both problems
+// are fixed here:
+//
+//   1. The duplicated inline handlers are gone. The api/ modules are the
+//      single definition of those routes, so a fix to a rate limit or a
+//      status query can no longer be silently reverted by editing one
+//      copy and not the other.
+//   2. The CORS-denial shim, the JSON 404 and the legacy inline error
+//      handler are extracted into src/middleware/. They were three
+//      separate `app.use` blocks with overlapping responsibilities, one
+//      of which (the inline error handler) duplicated
+//      src/middleware/errorHandler.js and would have shadowed it.
+//
+// See the module headers of src/middleware/notFound.js,
+// src/middleware/corsDenial.js and src/middleware/errorHandler.js for
+// the behaviour each one owns.
 
 const crypto = require('crypto');
 const express = require('express');
@@ -14,19 +50,9 @@ const {
   sentryErrorHandler,
   setRequestId: setSentryRequestId,
 } = require('./lib/sentry-config');
-const { captureException } = require('./lib/sentry-config');
-const auth = require('./middleware/auth');
-const ordersRouter = require('./api/orders');
-const { buildBudget, policyCheck, orderPollLimiter, openSSEStreamCount } = require('./api/orders');
-// Legacy /admin/* router was retired with the ampersand dashboard rewrite.
-// The new /dashboard surface (mounted below) is the canonical operator API
-// and is what /api/admin-proxy on the web app forwards to.
-const dashboardRouter = require('./api/dashboard');
-const authRouter = require('./api/auth');
-const internalRouter = require('./api/internal');
-const platformRouter = require('./api/platform');
-const vccCallbackRouter = require('./api/vcc-callback');
-const { MAX_WEBHOOK_ATTEMPTS: MAX_WEBHOOK_ATTEMPTS_FOR_STATUS } = require('./fulfillment');
+const { registerRoutes } = require('./routes');
+const corsDenial = require('./middleware/corsDenial');
+const notFound = require('./middleware/notFound');
 const errorHandler = require('./middleware/errorHandler');
 
 const app = express();
@@ -82,9 +108,17 @@ app.use(sentryRequestHandler());
 const REQ_ID_SHAPE = /^[A-Za-z0-9._:-]{1,64}$/;
 const _reqIdWarnedIps = new Set();
 
+/**
+ * Accept a client-supplied X-Request-ID only if it matches REQ_ID_SHAPE.
+ *
+ * Node joins duplicate headers with ', ' by default for most header
+ * names, but defensively handle both string[] and string.
+ *
+ * @param {unknown} raw
+ * @returns {string | null} the accepted id, or null to fall back to a
+ *   server-generated one
+ */
 function validateRequestId(raw) {
-  // Node joins duplicate headers with ', ' by default for most header
-  // names, but defensively handle both string[] and string.
   if (Array.isArray(raw)) raw = raw[0];
   if (typeof raw !== 'string') return null;
   if (!REQ_ID_SHAPE.test(raw)) return null;
@@ -754,6 +788,42 @@ app.use((err, req, res, next) => {
 
   res.status(500).json({ error: 'internal_error' });
 });
+// Every route lives in its own module under api/, and routes/index.js owns
+// the mount table. Three of those mounts are order-sensitive (the
+// unauthenticated MPP and claim endpoints, and the pre-auth failure limiter)
+// and the reasoning is documented there rather than here, so the answer to
+// "which paths require an api key" lives in exactly one place.
+registerRoutes(app);
+
+// ── Terminal middleware ─────────────────────────────────────────────────
+//
+// Order below is Express's error-handling contract, not preference:
+//
+//   corsDenial   — converts the Error that cors() throws on a rejected
+//                  origin into a structured 403. It is an error handler
+//                  (4 args) so it only runs on the error path.
+//   notFound     — plain (2 arg) middleware, so it only runs when no
+//                  route matched. It must be registered AFTER every
+//                  route, which is why it sits below registerRoutes.
+//   sentryError  — reports, then forwards via next(err).
+//   errorHandler — the last responder; formats the client response.
+//
+// corsDenial has to come before sentryError because a CORS rejection is
+// a client-configuration error, not a server fault: reporting it to
+// Sentry would page on-call for a browser sending a disallowed Origin.
+
+app.use(corsDenial);
+app.use(notFound);
+
+// Issue #29: Sentry's error handler must be mounted after all routes but
+// before the app's own errorHandler, so it can capture the error and then
+// call next(err) to hand off to errorHandler for the actual response —
+// see the app.use(sentryRequestHandler()) comment above for why this was
+// previously dead code.
+app.use(sentryErrorHandler());
+
+// Standardized global error handler
+app.use(errorHandler);
 
 module.exports = app;
 // Test-only exports for the 2026-04-16 audit hardening. Not part of

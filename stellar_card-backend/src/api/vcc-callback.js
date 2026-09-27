@@ -10,6 +10,7 @@ const { enqueueWebhook, refundOrQuarantine } = require('../fulfillment');
 const { verifyVccSignature } = require('../vcc-client');
 const { sealCard } = require('../lib/card-vault');
 const { normalizeCardBrand } = require('../lib/normalize-card');
+const { FulfillmentCard } = require('../lib/validate');
 const { event: bizEvent } = require('../lib/logger');
 const { recordAudit } = require('../lib/audit');
 
@@ -47,12 +48,20 @@ const router = Router();
 //
 // Validating the shape here means a malformed callback is rejected with
 // a specific 400 before it ever reaches sealCard() or an UPDATE.
-const cardSchema = z.object({
-  number: z.string().min(1, 'card.number is required'),
-  cvv: z.string().min(1, 'card.cvv is required'),
-  expiry: z.string().min(1, 'card.expiry is required'),
-  brand: z.string().optional(),
-});
+//
+// The object itself now lives in lib/validate.js (FulfillmentCard) so
+// this route and anything else that reasons about a fulfillment payload
+// share one definition, length bounds included: number/cvv/expiry/brand
+// are attacker-influenced and get sealed verbatim, and the original
+// inline schema had no notion of an upper bound at all. The required-field
+// messages are byte-identical to what this route returned before, since
+// they are part of the response contract.
+//
+// It is referenced, not `.extend()`ed: `extend` replaces a field's schema
+// wholesale, so overriding a message that way would silently drop the
+// inherited length cap — exactly the kind of bug this schema exists to
+// prevent.
+const cardSchema = FulfillmentCard;
 
 const baseBodySchema = z.object({
   order_id: z.string().min(1),
