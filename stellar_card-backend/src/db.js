@@ -935,9 +935,31 @@ applyMigration(29, () => {
   }
 });
 
+// Migration 30: composite index for the GET /v1/orders `since_updated_at`
+// poll shape (Part 4 of the list-orders optimization):
+//   SELECT id, status, amount_usdc, payment_asset, created_at, updated_at
+//   FROM orders
+//   WHERE api_key_id = ? AND updated_at >= ?
+//   ORDER BY created_at DESC LIMIT ? OFFSET ?
+// Pre-migration, EXPLAIN QUERY PLAN showed this shape resolving the
+// api_key_id equality through idx_orders_api_key_created_at and then
+// scanning every order the key has ever created to apply the updated_at
+// filter — each `since_updated_at` poll cost O(key history) instead of
+// O(new rows). Agents poll this filter to pick up status transitions
+// (ordering → delivered/failed) without re-fetching full history, so
+// the scan cost landed on the hottest polling path. The composite lets
+// the planner range-scan (api_key_id, updated_at) directly. Same
+// IF NOT EXISTS idiom as migration 24 — safe to re-run.
+applyMigration(30, () => {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_orders_api_key_updated_at
+      ON orders(api_key_id, updated_at);
+  `);
+});
+
 // EXPECTED_SCHEMA_VERSION must match the last `applyMigration(N)` call
 // above. Bump it in lock-step with any new migration.
-const EXPECTED_SCHEMA_VERSION = 29;
+const EXPECTED_SCHEMA_VERSION = 30;
 const actualVersion = getSchemaVersion();
 if (actualVersion > EXPECTED_SCHEMA_VERSION) {
   console.error(

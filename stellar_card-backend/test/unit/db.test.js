@@ -31,7 +31,7 @@ const { db, resetDb } = require('../helpers/app');
 // bumping the constant — that mismatch is what the "refusing to start"
 // guard at the bottom of db.js keys off, so a silent drift here turns
 // into a production boot failure.
-const EXPECTED_SCHEMA_VERSION = 29;
+const EXPECTED_SCHEMA_VERSION = 30;
 
 const DB_MODULE_PATH = path.join(__dirname, '..', '..', 'src', 'db.js');
 
@@ -695,6 +695,7 @@ describe('db.js — unique and partial indexes', () => {
       'idx_orders_stellar_txid',
       'idx_orders_api_key_status',
       'idx_orders_api_key_created_at',
+      'idx_orders_api_key_updated_at',
       'idx_orders_vcc_job_id',
       'idx_api_keys_key_prefix',
       'idx_api_keys_dashboard_id',
@@ -731,6 +732,69 @@ describe('db.js — unique and partial indexes', () => {
     );
     const detail = plan.map((r) => r.detail).join(' | ');
     assert.match(detail, /USING (COVERING )?INDEX idx_orders_api_key/, detail);
+  });
+});
+
+// ── List-orders query plans (Part 4) ─────────────────────────────────────
+//
+// GET /v1/orders (src/api/orders.js) serves four filter shapes over the
+// same base query — key equality, optional status equality, optional
+// created_at / updated_at lower bounds, always ORDER BY created_at DESC
+// with LIMIT/OFFSET. Migration 24 indexed the first three shapes;
+// migration 30 added idx_orders_api_key_updated_at for the fourth after
+// EXPLAIN QUERY PLAN showed it scanning the key's full history to apply
+// the updated_at filter. These tests lock the planner to the index
+// family for every shape. Like the migration-24 test above, they assert
+// on the plan — not the rows — because a dropped index keeps returning
+// correct results while silently regressing to a scan as the table
+// grows. Family match (idx_orders_api*) rather than exact index names:
+// which composite the planner prefers for a given shape is its
+// prerogative (it may trade a temp sort for a tighter range, as it does
+// for since_updated_at), and pinning names would couple the suite to
+// SQLite-version planner whims.
+
+describe('db.js — list-orders query plans (Part 4)', () => {
+  function planFor(whereClause) {
+    const plan = /** @type {any[]} */ (
+      db
+        .prepare(
+          `EXPLAIN QUERY PLAN
+           SELECT id, status, amount_usdc, payment_asset, created_at, updated_at
+           FROM orders ${whereClause}
+           ORDER BY created_at DESC LIMIT 20 OFFSET 0`,
+        )
+        .all()
+    );
+    return plan.map((r) => r.detail).join(' | ');
+  }
+
+  function assertIndexed(detail) {
+    assert.match(detail, /USING (COVERING )?INDEX idx_orders_api/, detail);
+    assert.doesNotMatch(detail, /SCAN orders/, detail);
+  }
+
+  it('plans the base key listing through an index, not a table scan', () => {
+    assertIndexed(planFor(`WHERE api_key_id = 'k'`));
+  });
+
+  it('plans the status-filtered listing through an index', () => {
+    assertIndexed(planFor(`WHERE api_key_id = 'k' AND status = 'delivered'`));
+  });
+
+  it('plans the since_created_at listing as an index range scan', () => {
+    const detail = planFor(`WHERE api_key_id = 'k' AND created_at >= '2026-01-01T00:00:00.000Z'`);
+    assertIndexed(detail);
+    assert.match(detail, /api_key_id=\? AND created_at>\?/, detail);
+  });
+
+  it('plans the since_updated_at listing through an index (migration 30)', () => {
+    // Pre-migration 30 this resolved api_key_id through
+    // idx_orders_api_key_created_at and scanned the key's full history
+    // for the updated_at bound. The dedicated composite turns the
+    // bound into a second range term.
+    const detail = planFor(`WHERE api_key_id = 'k' AND updated_at >= '2026-01-01T00:00:00.000Z'`);
+    assertIndexed(detail);
+    assert.match(detail, /api_key_id=\? AND updated_at>\?/, detail);
   });
 });
 
