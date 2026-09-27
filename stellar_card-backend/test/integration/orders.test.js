@@ -238,6 +238,29 @@ describe('GET /v1/orders/:id', () => {
     assert.equal(res.status, 404);
   });
 
+  // `:id` is bound straight into a `WHERE id = ?`, so an oversized path
+  // segment used to be bound and compared before anything rejected it.
+  // 256 is the cap; 257 is the first value that must be refused.
+  it('rejects an oversized :id with 400 instead of querying for it', async () => {
+    const tooLong = 'a'.repeat(257);
+    const res = await request.get(`/v1/orders/${tooLong}`).set('X-Api-Key', key.key);
+    assert.equal(res.status, 400);
+    assert.equal(res.body.error, 'invalid_request');
+  });
+
+  it('accepts an :id at exactly the 256-char cap', async () => {
+    const res = await request.get(`/v1/orders/${'a'.repeat(256)}`).set('X-Api-Key', key.key);
+    // Past the schema, so it is a real lookup that legitimately misses.
+    assert.equal(res.status, 404);
+  });
+
+  it('does not narrow :id to a UUID pattern', async () => {
+    // ids are uuid v4 on the create path but VCC-supplied on the callback
+    // path, so a pattern would 400 on a valid row.
+    const res = await request.get('/v1/orders/legacy_order_id-123').set('X-Api-Key', key.key);
+    assert.equal(res.status, 404);
+  });
+
   it('returns order with phase field', async () => {
     const orderId = seedOrder({ api_key_id: key.id, status: 'pending_payment' });
     const res = await request.get(`/v1/orders/${orderId}`).set('X-Api-Key', key.key);
