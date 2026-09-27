@@ -526,3 +526,615 @@ describe('F7-payment-handler: unmatched-payment routing', () => {
     assert.equal(findUnmatched('TX_UNKNOWN_ASSET').reason, 'unknown_asset');
   });
 });
+
+// ── Post-claim pipeline: getInvoice → payCtxOrder → notifyPaid ─────────────
+//
+// Everything above this line covers the decision to *claim* an order: the
+// amount comparison, the unmatched-payment routing, the atomic claim.
+// The branches below run after the claim has already flipped the row to
+// 'ordering', which is what makes them the expensive ones to get wrong —
+// by then the order is committed to a fulfillment path and a mistake
+// either double-spends treasury or wedges the row in 'ordering' with no
+// refund scheduled.
+//
+// They were previously only reachable through the e2e suite, which boots
+// a fake HTTP server and stubs the network collaborators at require.cache
+// level. Reaching the outer catch that way means engineering a 502 out of
+// the fake server, and the F1-jobs ambiguous branch needs an error object
+// carrying stellarStatus/txHash, which HTTP cannot produce. The vcc-client
+// import is a module object in src/payment-handler.js precisely so these
+// can be substituted directly.
+
+const vccClient = require('../../src/vcc-client');
+const xlmSender = require('../../src/payments/xlm-sender');
+const fulfillment = require('../../src/fulfillment');
+const logger = require('../../src/lib/logger');
+
+/** Swap collaborator methods for the duration of `fn`, always restoring. */
+async function withStubs(stubs, fn) {
+  const originals = new Map();
+  for (const [obj, key, impl] of stubs) originals.set(obj, [obj[key], key]);
+  const origError = console.error;
+  const origEvent = logger.event;
+  const events = [];
+  logger.event = (name, fields) => events.push({ name, fields });
+  console.error = () => {};
+  for (const [obj, key, impl] of stubs) obj[key] = impl;
+  try {
+    return await fn(events);
+  } finally {
+    for (const [obj, key] of originals) {
+      const [value] = originals.get(obj);
+      obj[key] = value;
+    }
+    logger.event = origEvent;
+    console.error = origError;
+  }
+}
+
+describe('payment-handler: post-claim pipeline', () => {
+  let apiKeyId;
+
+  beforeEach(async () => {
+    resetDb();
+    const key = await createTestKey({ label: 'pipeline-test' });
+    apiKeyId = key.id;
+  });
+
+  function seedOrder({ id = uuidv4(), amountUsdc = '10.00', expectedXlmAmount = null } = {}) {
+    db.prepare(
+      `INSERT INTO orders (id, status, amount_usdc, payment_asset, api_key_id, expected_xlm_amount, request_id, created_at, updated_at)
+       VALUES (?, 'pending_payment', ?, 'usdc', ?, ?, 'req-1', datetime('now'), datetime('now'))`,
+    ).run(id, amountUsdc, apiKeyId, expectedXlmAmount);
+    return id;
+  }
+
+  const getOrder = (id) => db.prepare(`SELECT * FROM orders WHERE id = ?`).get(id);
+
+  const okStubs = () => [
+    [
+      vccClient,
+      'getInvoice',
+      async () => ({
+        vccJobId: 'VCC_JOB_1',
+        // A real CTX invoice URI. parseStellarPayUri only recognises the
+        // `stellar:pay?` / `web+stellar:pay?` schemes and returns all-nulls
+        // for anything else, so an https:// URL here would silently leave
+        // ctx_invoice_xlm unset and the assertion below would pass for the
+        // wrong reason.
+        paymentUrl: 'stellar:pay?destination=GCTX&amount=12.5&memo=inv-1',
+        callbackNonce: 'nonce-1',
+      }),
+    ],
+    [vccClient, 'notifyPaid', async () => ({})],
+    [xlmSender, 'payCtxOrder', async () => 'CTX_TX_HASH_1'],
+    // The settlement rate is snapshotted from a live price oracle. Left
+    // unstubbed it turns a unit test into a network call with a multi-
+    // second timeout, so pin it — and assert on it, since the dashboard
+    // margin page depends on this column being populated.
+    [require('../../src/payments/xlm-price'), 'getXlmUsdPrice', async () => 0.12],
+  ];
+
+  it('persists every checkpoint so a mid-flight crash is recoverable', async () => {
+    const orderId = seedOrder();
+    await withStubs(okStubs(), async () => {
+      await handlePayment({
+        txid: 'TX_HAPPY',
+        paymentAsset: 'usdc_soroban',
+        amountUsdc: '10.00',
+        amountXlm: null,
+        senderAddress: 'GSENDER',
+        orderId,
+      });
+    });
+
+    const row = getOrder(orderId);
+    assert.equal(row.status, 'ordering');
+    assert.equal(row.stellar_txid, 'TX_HAPPY');
+    assert.equal(row.sender_address, 'GSENDER');
+    assert.equal(row.vcc_job_id, 'VCC_JOB_1');
+    assert.equal(row.callback_nonce, 'nonce-1');
+    // ctx_invoice_xlm comes from parsing the invoice payment URL, and is
+    // what the dashboard margin page uses for cost-of-sale.
+    assert.equal(row.ctx_invoice_xlm, '12.5');
+    // Snapshot of the XLM/USD rate at settlement, so margin can be
+    // computed later without re-querying a rate that has since moved.
+    assert.equal(row.settlement_xlm_usd_rate, '0.12');
+    // Set on success so the reconciler and ops can attribute the spend.
+    assert.equal(row.ctx_stellar_txid, 'CTX_TX_HASH_1');
+    assert.ok(row.xlm_sent_at, 'xlm_sent_at should be stamped');
+    assert.ok(row.vcc_notified_at, 'vcc_notified_at should be stamped');
+  });
+
+  it('persists excess_usdc on the row, not only in the bizEvent', async () => {
+    // refund bookkeeping reads the column; emitting the event alone would
+    // leave the operator with no way to know how much to send back.
+    const orderId = seedOrder();
+    await withStubs(okStubs(), async () => {
+      await handlePayment({
+        txid: 'TX_EXCESS',
+        paymentAsset: 'usdc_soroban',
+        amountUsdc: '12.25',
+        amountXlm: null,
+        senderAddress: 'GSENDER',
+        orderId,
+      });
+    });
+    const row = getOrder(orderId);
+    assert.match(row.excess_usdc, /^2\.2500000$/);
+  });
+
+  it('leaves excess_usdc untouched on an exact payment', async () => {
+    const orderId = seedOrder();
+    await withStubs(okStubs(), async () => {
+      await handlePayment({
+        txid: 'TX_EXACT2',
+        paymentAsset: 'usdc_soroban',
+        amountUsdc: '10.00',
+        amountXlm: null,
+        senderAddress: 'GSENDER',
+        orderId,
+      });
+    });
+    assert.equal(getOrder(orderId).excess_usdc, null);
+  });
+
+  it('still claims the order when the optional telemetry lookups fail', async () => {
+    // The xlm-price oracle and the URI parser are explicitly non-critical.
+    // A failure in either must not abort a paid order.
+    const orderId = seedOrder();
+    const pricePath = require.resolve('../../src/payments/xlm-price');
+    const senderPath = require.resolve('../../src/payments/xlm-sender');
+    const savedPrice = require.cache[pricePath];
+    const savedSender = require.cache[senderPath];
+    require.cache[pricePath] = {
+      exports: {
+        getXlmUsdPrice: async () => {
+          throw new Error('oracle down');
+        },
+      },
+    };
+    require.cache[senderPath] = { exports: { payCtxOrder: async () => 'CTX_TX_HASH_2' } };
+    try {
+      await withStubs(
+        [
+          [
+            vccClient,
+            'getInvoice',
+            async () => ({ vccJobId: 'J', paymentUrl: 'not-a-uri', callbackNonce: 'n' }),
+          ],
+          [vccClient, 'notifyPaid', async () => ({})],
+        ],
+        async () => {
+          await handlePayment({
+            txid: 'TX_TELEMETRY',
+            paymentAsset: 'usdc_soroban',
+            amountUsdc: '10.00',
+            amountXlm: null,
+            senderAddress: 'GSENDER',
+            orderId,
+          });
+        },
+      );
+    } finally {
+      if (savedPrice) require.cache[pricePath] = savedPrice;
+      else delete require.cache[pricePath];
+      if (savedSender) require.cache[senderPath] = savedSender;
+      else delete require.cache[senderPath];
+    }
+    const row = getOrder(orderId);
+    assert.equal(row.status, 'ordering');
+    assert.equal(row.settlement_xlm_usd_rate, null, 'oracle failure leaves the rate unset');
+  });
+});
+
+describe('F1-jobs: ambiguous CTX payment is parked, never auto-refunded', () => {
+  // The double-spend guard. payCtxOrder can throw after the tx has
+  // already landed on-chain (lost response). If that case were treated as
+  // a definite failure and refunded, treasury pays CTX once for the
+  // gift card and refunds the agent once for the same order.
+  // src/payment-handler.js parks the row instead and leaves it for ops.
+
+  let apiKeyId;
+
+  beforeEach(async () => {
+    resetDb();
+    const key = await createTestKey({ label: 'ambiguous-test' });
+    apiKeyId = key.id;
+  });
+
+  function seedOrder(id = uuidv4()) {
+    db.prepare(
+      `INSERT INTO orders (id, status, amount_usdc, payment_asset, api_key_id, created_at, updated_at)
+       VALUES (?, 'pending_payment', '10.00', 'usdc', ?, datetime('now'), datetime('now'))`,
+    ).run(id, apiKeyId);
+    return id;
+  }
+
+  const getOrder = (id) => db.prepare(`SELECT * FROM orders WHERE id = ?`).get(id);
+
+  function ambiguousError(stellarStatus) {
+    const err = new Error('submit response lost');
+    err.stellarStatus = stellarStatus;
+    err.txHash = 'CTX_AMBIGUOUS_HASH';
+    return err;
+  }
+
+  const baseStubs = (payImpl) => [
+    [
+      vccClient,
+      'getInvoice',
+      async () => ({
+        vccJobId: 'J_AMB',
+        paymentUrl: 'https://pay.stellar.test/xlm?amount=12.5',
+        callbackNonce: 'n-amb',
+      }),
+    ],
+    [
+      vccClient,
+      'notifyPaid',
+      async () => {
+        throw new Error('notifyPaid must not run for an ambiguous CTX payment');
+      },
+    ],
+    [xlmSender, 'payCtxOrder', payImpl],
+  ];
+
+  for (const stellarStatus of ['unknown', 'applied_failed']) {
+    it(`parks the order and refunds nothing when stellarStatus='${stellarStatus}'`, async () => {
+      const orderId = seedOrder();
+      let refundCalls = 0;
+      await withStubs(
+        [
+          ...baseStubs(async () => {
+            throw ambiguousError(stellarStatus);
+          }),
+          [
+            fulfillment,
+            'refundOrQuarantine',
+            async () => {
+              refundCalls++;
+            },
+          ],
+        ],
+        async (events) => {
+          await handlePayment({
+            txid: `TX_AMB_${stellarStatus}`,
+            paymentAsset: 'usdc_soroban',
+            amountUsdc: '10.00',
+            amountXlm: null,
+            senderAddress: 'GSENDER',
+            orderId,
+          });
+
+          const row = getOrder(orderId);
+          assert.equal(row.status, 'failed');
+          // The hash is what lets ops check the chain and decide.
+          assert.equal(row.ctx_stellar_txid, 'CTX_AMBIGUOUS_HASH');
+          // This is the assertion the whole branch exists for.
+          assert.equal(refundCalls, 0, 'an ambiguous payment must never trigger a refund');
+          const evt = events.find((e) => e.name === 'ctx.payment_ambiguous');
+          assert.ok(evt, 'expected ctx.payment_ambiguous bizEvent');
+          assert.equal(evt.fields.stellar_status, stellarStatus);
+          assert.equal(evt.fields.tx_hash, 'CTX_AMBIGUOUS_HASH');
+        },
+      );
+    });
+  }
+
+  it('does NOT park when the error carries a status but no tx hash', async () => {
+    // Without a hash there is nothing for ops to verify on-chain, so the
+    // outcome is a definite failure: refund normally.
+    const orderId = seedOrder();
+    const err = new Error('rejected before submit');
+    err.stellarStatus = 'unknown';
+    // deliberately no txHash
+
+    let refundCalls = 0;
+    await withStubs(
+      [
+        ...baseStubs(async () => {
+          throw err;
+        }),
+        [
+          fulfillment,
+          'refundOrQuarantine',
+          async () => {
+            refundCalls++;
+          },
+        ],
+      ],
+      async () => {
+        await handlePayment({
+          txid: 'TX_AMB_NO_HASH',
+          paymentAsset: 'usdc_soroban',
+          amountUsdc: '10.00',
+          amountXlm: null,
+          senderAddress: 'GSENDER',
+          orderId,
+        });
+      },
+    );
+    assert.equal(getOrder(orderId).status, 'failed');
+    assert.equal(getOrder(orderId).ctx_stellar_txid, null);
+    assert.equal(refundCalls, 1, 'a hashless failure is a definite failure and must refund');
+  });
+
+  it('does NOT park for an unrelated error status', async () => {
+    const orderId = seedOrder();
+    const err = new Error('insufficient balance');
+    err.stellarStatus = 'rejected';
+    err.txHash = 'SOME_HASH';
+
+    let refundCalls = 0;
+    await withStubs(
+      [
+        ...baseStubs(async () => {
+          throw err;
+        }),
+        [
+          fulfillment,
+          'refundOrQuarantine',
+          async () => {
+            refundCalls++;
+          },
+        ],
+      ],
+      async () => {
+        await handlePayment({
+          txid: 'TX_REJECTED',
+          paymentAsset: 'usdc_soroban',
+          amountUsdc: '10.00',
+          amountXlm: null,
+          senderAddress: 'GSENDER',
+          orderId,
+        });
+      },
+    );
+    assert.equal(refundCalls, 1);
+  });
+});
+
+describe('payment-handler: outer catch after the claim', () => {
+  // The claim has already committed the row to 'ordering' by this point,
+  // so the catch is the only thing standing between a paid order and a
+  // row that is stuck in 'ordering' forever with no refund.
+
+  let apiKeyId;
+
+  beforeEach(async () => {
+    resetDb();
+    const key = await createTestKey({ label: 'catch-test' });
+    apiKeyId = key.id;
+  });
+
+  function seedOrder(id = uuidv4()) {
+    db.prepare(
+      `INSERT INTO orders (id, status, amount_usdc, payment_asset, api_key_id, created_at, updated_at)
+       VALUES (?, 'pending_payment', '10.00', 'usdc', ?, datetime('now'), datetime('now'))`,
+    ).run(id, apiKeyId);
+    return id;
+  }
+
+  const getOrder = (id) => db.prepare(`SELECT * FROM orders WHERE id = ?`).get(id);
+
+  it('marks the order failed and schedules a refund when getInvoice throws', async () => {
+    const orderId = seedOrder();
+    let refundArgs = null;
+    await withStubs(
+      [
+        [
+          vccClient,
+          'getInvoice',
+          async () => {
+            throw new Error('vcc 502');
+          },
+        ],
+        [
+          fulfillment,
+          'refundOrQuarantine',
+          async (...a) => {
+            refundArgs = a;
+          },
+        ],
+      ],
+      async () => {
+        await handlePayment({
+          txid: 'TX_INVOICE_FAIL',
+          paymentAsset: 'usdc_soroban',
+          amountUsdc: '10.00',
+          amountXlm: null,
+          senderAddress: 'GSENDER',
+          orderId,
+        });
+      },
+    );
+    const row = getOrder(orderId);
+    assert.equal(row.status, 'failed');
+    // The raw upstream string is sanitised before it lands in the column:
+    // agents read this via GET /v1/orders/:id.
+    assert.ok(row.error);
+    assert.doesNotMatch(row.error, /502/);
+    assert.equal(refundArgs[0], orderId);
+  });
+
+  it('handles a thrown null without the catch block itself crashing', async () => {
+    // F1-payment-handler: `err.message` on null throws inside the catch,
+    // which would leave the row wedged in 'ordering' with no refund.
+    const orderId = seedOrder();
+    let refundCalls = 0;
+    await withStubs(
+      [
+        [
+          vccClient,
+          'getInvoice',
+          async () => {
+            throw null;
+          },
+        ],
+        [
+          fulfillment,
+          'refundOrQuarantine',
+          async () => {
+            refundCalls++;
+          },
+        ],
+      ],
+      async () => {
+        await handlePayment({
+          txid: 'TX_THROW_NULL',
+          paymentAsset: 'usdc_soroban',
+          amountUsdc: '10.00',
+          amountXlm: null,
+          senderAddress: 'GSENDER',
+          orderId,
+        });
+      },
+    );
+    assert.equal(getOrder(orderId).status, 'failed');
+    assert.equal(refundCalls, 1);
+  });
+
+  it('handles a thrown string without the catch block itself crashing', async () => {
+    const orderId = seedOrder();
+    let refundCalls = 0;
+    await withStubs(
+      [
+        [
+          vccClient,
+          'getInvoice',
+          async () => {
+            throw 'plain string failure';
+          },
+        ],
+        [
+          fulfillment,
+          'refundOrQuarantine',
+          async () => {
+            refundCalls++;
+          },
+        ],
+      ],
+      async () => {
+        await handlePayment({
+          txid: 'TX_THROW_STRING',
+          paymentAsset: 'usdc_soroban',
+          amountUsdc: '10.00',
+          amountXlm: null,
+          senderAddress: 'GSENDER',
+          orderId,
+        });
+      },
+    );
+    assert.equal(getOrder(orderId).status, 'failed');
+    assert.equal(refundCalls, 1);
+  });
+
+  it('hands the CTX-paid row to refundOrQuarantine with ctx_stellar_txid intact', async () => {
+    // ctx_stellar_txid is set on the success path before notifyPaid runs.
+    // refundOrQuarantine reads that column to decide refund-vs-quarantine,
+    // so the property worth asserting here is that the marker survived the
+    // failure — a handler that cleared it would turn a "verify on-chain"
+    // case into a silent treasury loss.
+    const orderId = seedOrder();
+    let seenCtxTxid = 'not-called';
+    await withStubs(
+      [
+        [
+          vccClient,
+          'getInvoice',
+          async () => ({
+            vccJobId: 'J',
+            paymentUrl: 'stellar:pay?destination=GCTX&amount=1',
+            callbackNonce: 'n',
+          }),
+        ],
+        [
+          vccClient,
+          'notifyPaid',
+          async () => {
+            throw new Error('notify failed after CTX paid');
+          },
+        ],
+        [xlmSender, 'payCtxOrder', async () => 'CTX_TX_OK'],
+        [
+          fulfillment,
+          'refundOrQuarantine',
+          async (id) => {
+            seenCtxTxid = db
+              .prepare(`SELECT ctx_stellar_txid FROM orders WHERE id = ?`)
+              .get(id).ctx_stellar_txid;
+          },
+        ],
+      ],
+      async () => {
+        await handlePayment({
+          txid: 'TX_LATE_FAIL',
+          paymentAsset: 'usdc_soroban',
+          amountUsdc: '10.00',
+          amountXlm: null,
+          senderAddress: 'GSENDER',
+          orderId,
+        });
+      },
+    );
+    const row = getOrder(orderId);
+    assert.equal(row.status, 'failed');
+    assert.equal(seenCtxTxid, 'CTX_TX_OK', 'the CTX payment marker must reach the router');
+  });
+});
+
+describe('payment-handler: lost claim race', () => {
+  // The status check and the UPDATE are two statements, so a second
+  // payment event for the same order can pass the check and then find
+  // the row already claimed. That loser must be recorded for refund
+  // rather than proceeding to pay the supplier twice.
+
+  it('records duplicate_payment when the claim UPDATE matches no rows', async () => {
+    resetDb();
+    const key = await createTestKey({ label: 'race-test' });
+    const orderId = uuidv4();
+    db.prepare(
+      `INSERT INTO orders (id, status, amount_usdc, payment_asset, api_key_id, created_at, updated_at)
+       VALUES (?, 'pending_payment', '10.00', 'usdc', ?, datetime('now'), datetime('now'))`,
+    ).run(orderId, key.id);
+
+    // Simulate the race by flipping the row to 'ordering' immediately
+    // after handlePayment's SELECT reads it, so its UPDATE — which
+    // requires status = 'pending_payment' — matches nothing.
+    const realPrepare = db.prepare.bind(db);
+    let flipped = false;
+    db.prepare = (sql) => {
+      const stmt = realPrepare(sql);
+      if (!flipped && /SELECT \* FROM orders WHERE id/.test(sql)) {
+        flipped = true;
+        const origGet = stmt.get.bind(stmt);
+        stmt.get = (...args) => {
+          const row = origGet(...args);
+          realPrepare(`UPDATE orders SET status = 'ordering' WHERE id = ?`).run(...args);
+          return row;
+        };
+      }
+      return stmt;
+    };
+
+    try {
+      await handlePayment({
+        txid: 'TX_RACE_LOSER',
+        paymentAsset: 'usdc_soroban',
+        amountUsdc: '10.00',
+        amountXlm: null,
+        senderAddress: 'GSENDER',
+        orderId,
+      });
+    } finally {
+      db.prepare = realPrepare;
+    }
+
+    const unmatched = db
+      .prepare(`SELECT * FROM unmatched_payments WHERE stellar_txid = 'TX_RACE_LOSER'`)
+      .get();
+    assert.ok(unmatched, 'the losing event must be recorded for refund');
+    assert.equal(unmatched.reason, 'duplicate_payment');
+  });
+});

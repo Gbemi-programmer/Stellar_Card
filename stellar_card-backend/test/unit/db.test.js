@@ -26,14 +26,19 @@ const { execFileSync } = require('node:child_process');
 const { v4: uuidv4 } = require('uuid');
 const { db, resetDb } = require('../helpers/app');
 
-// Must stay in lock-step with EXPECTED_SCHEMA_VERSION in src/db.js. The
-// test asserting equality is the tripwire for a migration added without
-// bumping the constant — that mismatch is what the "refusing to start"
-// guard at the bottom of db.js keys off, so a silent drift here turns
-// into a production boot failure.
-const EXPECTED_SCHEMA_VERSION = 29;
-
 const DB_MODULE_PATH = path.join(__dirname, '..', '..', 'src', 'db.js');
+
+// Read from src/db.js rather than hardcoding, so a new migration needs one
+// edit instead of two. The tripwire is preserved in the direction that
+// matters: this parses the *declared* constant, which is then compared
+// against what actually landed in schema_migrations. Adding
+// `applyMigration(N)` while forgetting to bump EXPECTED_SCHEMA_VERSION
+// still fails here — and that is the drift which turns into the
+// "refusing to start" boot failure at the bottom of db.js. A hardcoded
+// copy in the test only relocated that footgun to a second file.
+const EXPECTED_SCHEMA_VERSION = Number(
+  /const EXPECTED_SCHEMA_VERSION = (\d+);/.exec(fs.readFileSync(DB_MODULE_PATH, 'utf8'))[1],
+);
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -70,7 +75,20 @@ function insertOrder({ id = uuidv4(), apiKeyId = null, status = 'pending_payment
 function bootFreshDb(dbPath, expression) {
   const script = `
     const db = require(${JSON.stringify(DB_MODULE_PATH)});
-    process.stdout.write(JSON.stringify(${expression}));
+    const out = JSON.stringify(${expression});
+    // Close the handle before the process ends. Two reasons:
+    //
+    //   1. These tests point at a real file, and an unclosed WAL
+    //      connection leaves -wal/-shm files behind for the tmpdir
+    //      sweep in the after() hook to race with.
+    //   2. better-sqlite3 finalises its cached statements during
+    //      process teardown. On Node >= 24 a Statement that is garbage
+    //      collected after V8 has torn the environment down aborts the
+    //      process with "Assertion failed: (env) != nullptr", which
+    //      makes execFileSync throw even though the expression
+    //      evaluated correctly.
+    db.close();
+    process.stdout.write(out);
   `;
   const out = execFileSync(process.execPath, ['-e', script], {
     env: { ...process.env, DB_PATH: dbPath, NODE_ENV: 'test' },
@@ -720,6 +738,13 @@ describe('db.js — unique and partial indexes', () => {
     // only way to catch an index being dropped — the query keeps
     // returning correct results either way, it just gets slower as the
     // table grows.
+    //
+    // Matched on "uses some index" rather than a specific index name:
+    // migration 30 added idx_orders_list_status, which the planner now
+    // prefers here because `status IN (...)` maps onto one seek per
+    // listed status. Pinned to the migration-24 index this test would
+    // have failed on an equally good — in this case better — plan, which
+    // is the wrong thing for a regression guard to do.
     const plan = /** @type {any[]} */ (
       db
         .prepare(
@@ -730,7 +755,8 @@ describe('db.js — unique and partial indexes', () => {
         .all('some-key')
     );
     const detail = plan.map((r) => r.detail).join(' | ');
-    assert.match(detail, /USING (COVERING )?INDEX idx_orders_api_key/, detail);
+    assert.match(detail, /USING (COVERING )?INDEX/, detail);
+    assert.doesNotMatch(detail, /SCAN orders(?!\s+USING)/, detail);
   });
 });
 
@@ -1041,9 +1067,12 @@ describe('db.js — auth_codes table queries', () => {
   it('inserts and retrieves an auth code by email', () => {
     const id = uuidv4();
     const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
-    db.prepare(
-      `INSERT INTO auth_codes (id, email, code_hash, expires_at) VALUES (?, ?, ?, ?)`,
-    ).run(id, 'alice@example.com', 'hashed-code', expiresAt);
+    db.prepare(`INSERT INTO auth_codes (id, email, code_hash, expires_at) VALUES (?, ?, ?, ?)`).run(
+      id,
+      'alice@example.com',
+      'hashed-code',
+      expiresAt,
+    );
 
     const rows = db.prepare(`SELECT * FROM auth_codes WHERE email = ?`).all('alice@example.com');
     assert.equal(rows.length, 1);
@@ -1053,9 +1082,12 @@ describe('db.js — auth_codes table queries', () => {
   it('marking a code used sets used_at', () => {
     const id = uuidv4();
     const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
-    db.prepare(
-      `INSERT INTO auth_codes (id, email, code_hash, expires_at) VALUES (?, ?, ?, ?)`,
-    ).run(id, 'alice@example.com', 'hashed-code', expiresAt);
+    db.prepare(`INSERT INTO auth_codes (id, email, code_hash, expires_at) VALUES (?, ?, ?, ?)`).run(
+      id,
+      'alice@example.com',
+      'hashed-code',
+      expiresAt,
+    );
 
     db.prepare(`UPDATE auth_codes SET used_at = datetime('now') WHERE id = ?`).run(id);
     const row = db.prepare(`SELECT used_at FROM auth_codes WHERE id = ?`).get(id);
@@ -1158,9 +1190,7 @@ describe('db.js — webhook_deliveries table queries', () => {
        VALUES (?, ?, ?, ?)`,
     ).run('dash-1', 'https://example.com/hook', 200, 42);
 
-    const row = db
-      .prepare(`SELECT * FROM webhook_deliveries WHERE dashboard_id = ?`)
-      .get('dash-1');
+    const row = db.prepare(`SELECT * FROM webhook_deliveries WHERE dashboard_id = ?`).get('dash-1');
     assert.ok(row);
     assert.equal(row.method, 'POST', 'method should default to POST');
     assert.equal(row.response_status, 200);
@@ -1168,18 +1198,78 @@ describe('db.js — webhook_deliveries table queries', () => {
 
   it('orders deliveries by created_at DESC for the dashboard feed query', () => {
     const insertAt = (url) =>
-      db
-        .prepare(`INSERT INTO webhook_deliveries (dashboard_id, url) VALUES ('dash-1', ?)`)
-        .run(url).lastInsertRowid;
+      db.prepare(`INSERT INTO webhook_deliveries (dashboard_id, url) VALUES ('dash-1', ?)`).run(url)
+        .lastInsertRowid;
     insertAt('https://example.com/first');
     insertAt('https://example.com/second');
 
     const rows = db
-      .prepare(
-        `SELECT url FROM webhook_deliveries WHERE dashboard_id = 'dash-1' ORDER BY id DESC`,
-      )
+      .prepare(`SELECT url FROM webhook_deliveries WHERE dashboard_id = 'dash-1' ORDER BY id DESC`)
       .all();
     assert.equal(rows[0].url, 'https://example.com/second');
     assert.equal(rows[1].url, 'https://example.com/first');
+  });
+});
+
+// Migration 30 added a composite index so GET /v1/orders with a `status`
+// filter stops being O(rows for the key) — see the migration comment for
+// the measurements. The interesting property is not that the index exists
+// but that the planner *picks* it: an unused index is write overhead on
+// the hottest table in the schema for nothing, and a dropped one silently
+// restores the old plan with no error anywhere.
+describe('db.js — order list query plan', () => {
+  const LIST_SQL =
+    `SELECT id, status, amount_usdc, payment_asset, created_at, updated_at ` +
+    `FROM orders WHERE api_key_id = ? AND status = ? ` +
+    `ORDER BY created_at DESC LIMIT ? OFFSET ?`;
+
+  function planFor(sql, ...args) {
+    return db
+      .prepare(`EXPLAIN QUERY PLAN ${sql}`)
+      .all(...args)
+      .map((/** @type {any} */ r) => r.detail)
+      .join(' | ');
+  }
+
+  it('creates idx_orders_list_status', () => {
+    const row = db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_orders_list_status'`)
+      .get();
+    assert.ok(row, 'idx_orders_list_status should exist');
+    assert.match(/** @type {any} */ (row).sql, /api_key_id\s*,\s*status\s*,\s*created_at\s+DESC/i);
+  });
+
+  it('serves a status-filtered list from the composite index', () => {
+    const plan = planFor(LIST_SQL, 'k1', 'delivered', 20, 0);
+    assert.match(plan, /idx_orders_list_status/);
+  });
+
+  it('does not sort the result to satisfy ORDER BY', () => {
+    // The temp B-tree is the cost the index exists to remove: the index
+    // already yields created_at DESC within (api_key_id, status), so any
+    // sort here means the planner fell back to a plan that has to
+    // materialise every matching row before applying LIMIT.
+    const plan = planFor(LIST_SQL, 'k1', 'delivered', 20, 0);
+    assert.doesNotMatch(plan, /TEMP B-TREE/i);
+  });
+
+  it('still uses an index (never a bare table scan) for the list query', () => {
+    // Guards the opposite failure: an index that cannot serve the
+    // equality columns degrades into SCAN orders.
+    const plan = planFor(LIST_SQL, 'k1', 'delivered', 20, 0);
+    assert.doesNotMatch(plan, /SCAN orders(?!\s+USING)/);
+  });
+
+  it('leaves the unfiltered list plan alone', () => {
+    // idx_orders_api_key_created_at already serves this one perfectly;
+    // migration 30 must not push it onto a worse plan.
+    const plan = planFor(
+      `SELECT id, status, amount_usdc, payment_asset, created_at, updated_at ` +
+        `FROM orders WHERE api_key_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+      'k1',
+      20,
+      0,
+    );
+    assert.doesNotMatch(plan, /TEMP B-TREE/i);
   });
 });

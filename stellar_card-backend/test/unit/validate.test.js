@@ -9,11 +9,6 @@
 // behaviour is covered by the integration suite.
 
 require('../helpers/env');
-// Unit tests for src/middleware/validate.js (Issue #27).
-//
-// No DB / Express server needed — validateBody() only touches req.body,
-// res.status().json(), and next(), so it's exercised directly with mock
-// objects rather than spinning up a full app.
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
@@ -26,6 +21,8 @@ const {
   jsonObject,
   boundedIntQuery,
   optionalIsoTimestamp,
+  orderIdParam,
+  FulfillmentCard,
   NON_OBJECT_BODY_MESSAGE,
 } = require('../../src/lib/validate');
 
@@ -33,10 +30,6 @@ const {
 
 function fakeRes() {
   return {
-const { validateBody } = require('../../src/middleware/validate');
-
-function mockRes() {
-  const res = {
     statusCode: null,
     body: null,
     status(code) {
@@ -406,86 +399,240 @@ describe('jsonObject', () => {
     const result = schema.safeParse({ v: { n: BigInt(1) } });
     assert.equal(result.success, false);
     assert.equal(result.error.issues[0].message, 'could not be serialized');
-  return res;
-}
-
-const schema = z.object({
-  email: z.string().regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, 'A valid email address is required.'),
+  });
 });
 
-describe('validateBody', () => {
-  it('rejects an array body with 400 invalid_request by default', () => {
-    const req = { body: [{ email: 'a@b.com' }] };
-    const res = mockRes();
-    let nextCalled = false;
-    validateBody(schema)(req, res, () => {
-      nextCalled = true;
-    });
-    assert.equal(res.statusCode, 400);
-    assert.equal(res.body.error, 'invalid_request');
-    assert.equal(nextCalled, false);
+describe('boundedIntQuery', () => {
+  const schema = z.object({
+    limit: boundedIntQuery({ default: 20, min: 1, max: 200 }),
   });
 
-  it('rejects a missing body with 400 invalid_request', () => {
-    const req = { body: undefined };
-    const res = mockRes();
-    validateBody(schema)(req, res, () => {});
-    assert.equal(res.statusCode, 400);
-    assert.equal(res.body.error, 'invalid_request');
+  it('passes an in-range integer straight through', () => {
+    assert.equal(schema.parse({ limit: '50' }).limit, 50);
   });
 
-  it('rejects a null body value with 400 invalid_request', () => {
-    const req = { body: null };
-    const res = mockRes();
-    validateBody(schema)(req, res, () => {});
-    assert.equal(res.statusCode, 400);
-    assert.equal(res.body.error, 'invalid_request');
+  it('already-typed numbers are accepted too', () => {
+    // A hand-rolled caller (or a future Express config that parses the
+    // query) may hand us a number rather than a string.
+    assert.equal(schema.parse({ limit: 50 }).limit, 50);
   });
 
-  it('uses fieldErrorCode for schema validation failures, not bodyErrorCode', () => {
-    const req = { body: {} };
-    const res = mockRes();
-    validateBody(schema, { fieldErrorCode: 'invalid_email' })(req, res, () => {});
-    assert.equal(res.statusCode, 400);
-    assert.equal(res.body.error, 'invalid_email');
+  it('applies the default when the key is absent or null', () => {
+    for (const obj of [{}, { limit: undefined }, { limit: null }]) {
+      assert.equal(schema.parse(obj).limit, 20, JSON.stringify(obj));
+    }
   });
 
-  it('rejects a field with the wrong type (array instead of string)', () => {
-    const req = { body: { email: ['a@b.com'] } };
-    const res = mockRes();
-    validateBody(schema, { fieldErrorCode: 'invalid_email' })(req, res, () => {});
-    assert.equal(res.statusCode, 400);
-    assert.equal(res.body.error, 'invalid_email');
+  it('treats an empty string as absent rather than as zero', () => {
+    // `?limit=` is a client that sent the key with no value. parseInt('')
+    // is NaN, which the `|| fallback` this replaces also resolved to the
+    // default — but the clamp would have turned a parsed 0 into 1.
+    assert.equal(schema.parse({ limit: '' }).limit, 20);
   });
 
-  it('rejects a value that fails the schema regex', () => {
-    const req = { body: { email: 'not-an-email' } };
-    const res = mockRes();
-    validateBody(schema, { fieldErrorCode: 'invalid_email' })(req, res, () => {});
-    assert.equal(res.statusCode, 400);
-    assert.equal(res.body.error, 'invalid_email');
+  it('clamps into range on both ends', () => {
+    assert.equal(schema.parse({ limit: '0' }).limit, 1);
+    assert.equal(schema.parse({ limit: '-10' }).limit, 1);
+    assert.equal(schema.parse({ limit: '100000' }).limit, 200);
   });
 
-  it('calls next() and replaces req.body with the parsed value on success', () => {
-    const req = { body: { email: 'user@example.com' } };
-    const res = mockRes();
-    let nextCalled = false;
-    validateBody(schema)(req, res, () => {
-      nextCalled = true;
-    });
-    assert.equal(nextCalled, true);
-    assert.equal(res.statusCode, null);
-    assert.deepEqual(req.body, { email: 'user@example.com' });
+  it('falls back to the default for values that are not numbers at all', () => {
+    for (const limit of ['abc', 'NaN', 'Infinity', {}, []]) {
+      assert.equal(schema.parse({ limit }).limit, 20, JSON.stringify(limit));
+    }
   });
 
-  it('supports custom bodyErrorCode / bodyErrorMessage overrides', () => {
-    const req = { body: 'not-an-object' };
-    const res = mockRes();
-    validateBody(schema, {
-      bodyErrorCode: 'custom_shape_error',
-      bodyErrorMessage: 'custom message',
-    })(req, res, () => {});
-    assert.equal(res.body.error, 'custom_shape_error');
-    assert.equal(res.body.message, 'custom message');
+  it('accepts a parseInt-style numeric prefix', () => {
+    // parseInt('1e') is 1 and parseInt('12abc') is 12. That is the
+    // long-standing `parseInt(x, 10) || fallback` behaviour this
+    // replaces, kept deliberately: a client sending "12abc" was already
+    // treated as 12 before, and silently changing it to the default
+    // would be a wire-contract change for no security benefit. The clamp
+    // is what bounds the query, not the strictness of the parse.
+    assert.equal(schema.parse({ limit: '1e' }).limit, 1);
+    assert.equal(schema.parse({ limit: '12abc' }).limit, 12);
+  });
+
+  it('truncates a decimal rather than rounding it', () => {
+    // parseInt('3.9') is 3. The previous inline `parseInt(...) || 20`
+    // behaved identically; the contract is not "round", it is "truncate".
+    assert.equal(schema.parse({ limit: '3.9' }).limit, 3);
+  });
+});
+
+describe('optionalIsoTimestamp', () => {
+  const schema = z.object({ since: optionalIsoTimestamp('bad timestamp') });
+
+  it('keeps a well-formed timestamp byte-identical', () => {
+    // These values are compared lexically against created_at, so the
+    // middleware must not reformat them into a different shape.
+    const value = '2026-04-16T00:00:00.000Z';
+    assert.equal(schema.parse({ since: value }).since, value);
+  });
+
+  it('treats undefined, null and empty string as "no filter"', () => {
+    for (const obj of [{}, { since: undefined }, { since: null }, { since: '' }]) {
+      const parsed = schema.parse(obj);
+      assert.equal(parsed.since, undefined, JSON.stringify(obj));
+    }
+  });
+
+  it('rejects an unparseable value', () => {
+    for (const since of ['yesterday', '2026-13-45', 'not-a-date']) {
+      const result = schema.safeParse({ since });
+      assert.equal(result.success, false, since);
+      assert.equal(result.error.issues[0].message, 'bad timestamp');
+    }
+  });
+
+  it('accepts anything Date.parse understands, including odd years', () => {
+    // The guard is `!Number.isNaN(Date.parse(x))`, not "looks like an
+    // ISO-8601 string". `Date.parse('12345')` resolves to a real instant
+    // (year 12345), so it passes. That is a wide but harmless net: the
+    // value is only ever used as a `created_at >= ?` bound, and a
+    // syntactically valid-but-enormous date matches nothing rather than
+    // erroring. Tightening this to a strict ISO check would be a
+    // wire-contract change and is deliberately out of scope.
+    const parsed = schema.parse({ since: '12345' });
+    assert.equal(parsed.since, '12345');
+  });
+
+  it('rejects a non-string value instead of coercing it', () => {
+    // Date.parse(12345) is NaN, but Date.parse(new Date()) is not — a
+    // number or a Date object that slipped through as a "timestamp" must
+    // not become a filter bound of the current time. Arrays are the one
+    // deliberate exception: Express hands a repeated ?since= key over as
+    // an array, and the first value wins (covered below).
+    for (const since of [12345, {}, new Date()]) {
+      const result = schema.safeParse({ since });
+      assert.equal(result.success, false, String(since));
+    }
+  });
+
+  it('takes the first value when the key is repeated', () => {
+    // ?since=a&since=b reaches the handler as an array.
+    const parsed = schema.parse({ since: ['2026-04-16T00:00:00.000Z', 'nonsense'] });
+    assert.equal(parsed.since, '2026-04-16T00:00:00.000Z');
+  });
+
+  it('rejects a repeated key whose first value is malformed', () => {
+    // Validating only the first element is deliberate (it is the one
+    // Express would route into a handler), but "the first one is
+    // checked" must not quietly mean "a bad first value is ignored".
+    const result = schema.safeParse({ since: ['nonsense', '2026-04-16T00:00:00.000Z'] });
+    assert.equal(result.success, false);
+  });
+});
+
+describe('orderIdParam', () => {
+  const schema = z.object({ id: orderIdParam() }).passthrough();
+
+  it('accepts a uuid v4 as generated on the create path', () => {
+    const id = require('uuid').v4();
+    assert.equal(schema.safeParse({ id }).success, true);
+  });
+
+  it('accepts a non-uuid id, since orders are also created by VCC', () => {
+    // A UUID pattern here would 400 on a perfectly valid row, turning a
+    // schema change into an outage.
+    assert.equal(schema.safeParse({ id: 'legacy_order_id-123' }).success, true);
+  });
+
+  it('rejects an empty id', () => {
+    assert.equal(schema.safeParse({ id: '' }).success, false);
+  });
+
+  it('rejects an id at 257 characters and accepts one at 256', () => {
+    assert.equal(schema.safeParse({ id: 'a'.repeat(257) }).success, false);
+    assert.equal(schema.safeParse({ id: 'a'.repeat(256) }).success, true);
+  });
+
+  it('keeps sibling params, so a sub-route can add one', () => {
+    // validate() assigns its parse output back onto req.params, so a
+    // stripping object would drop anything a future sub-route declares.
+    const result = schema.safeParse({ id: 'abc', view: 'full' });
+    assert.equal(result.success, true);
+    assert.equal(result.data.view, 'full');
+  });
+});
+
+describe('boundedString with a minLength', () => {
+  const schema = z.object({
+    name: boundedString(4, 'name is required', 'name is too long', { minLength: 1 }),
+  });
+
+  it('treats a present-but-empty value as the same problem as a missing one', () => {
+    // Inventing a third message here would mean the caller has to keep
+    // it in sync, and the wire contract already says "required" for both.
+    const result = schema.safeParse({ name: '' });
+    assert.equal(result.success, false);
+    assert.equal(result.error.issues[0].message, 'name is required');
+  });
+
+  it('keeps the empty-string case out of the length branch', () => {
+    // Without the early return, an over-long value could also trip the
+    // min check and report two issues for one problem.
+    const result = schema.safeParse({ name: 'abcde' });
+    assert.equal(result.error.issues.length, 1);
+    assert.equal(result.error.issues[0].message, 'name is too long');
+  });
+
+  it('defaults to a minLength of 0, so "" is still allowed', () => {
+    const open = z.object({ name: boundedString(4, 'bad type', 'too long') });
+    assert.equal(open.safeParse({ name: '' }).success, true);
+  });
+});
+
+describe('FulfillmentCard', () => {
+  const valid = { number: '4111111111111111', cvv: '123', expiry: '12/27' };
+
+  it('accepts the minimal shape', () => {
+    assert.equal(FulfillmentCard.safeParse(valid).success, true);
+  });
+
+  it('treats brand as optional', () => {
+    const result = FulfillmentCard.safeParse({ ...valid, brand: 'Visa' });
+    assert.equal(result.success, true);
+  });
+
+  it('rejects a non-object', () => {
+    assert.equal(FulfillmentCard.safeParse(null).success, false);
+    assert.equal(FulfillmentCard.safeParse('4111111111111111').success, false);
+  });
+
+  it('requires number, cvv and expiry to be non-empty strings', () => {
+    // These messages are part of the vcc-callback response contract and
+    // must stay byte-identical to the inline schema they replaced.
+    for (const field of ['number', 'cvv', 'expiry']) {
+      for (const bad of ['', null, undefined, 7]) {
+        const result = FulfillmentCard.safeParse({ ...valid, [field]: bad });
+        assert.equal(result.success, false, `${field}=${JSON.stringify(bad)} should fail`);
+        assert.equal(result.error.issues[0].message, `card.${field} is required`);
+      }
+    }
+  });
+
+  // The vault has no idea how long a PAN is, so an unbounded value would
+  // be sealed verbatim and only discovered to be garbage on reveal.
+  it('bounds every field that gets sealed', () => {
+    for (const [field, overBy] of [
+      ['number', 33],
+      ['cvv', 9],
+      ['expiry', 17],
+      ['brand', 129],
+    ]) {
+      const result = FulfillmentCard.safeParse({ ...valid, [field]: 'x'.repeat(overBy) });
+      assert.equal(result.success, false, `${field} should be bounded`);
+    }
+  });
+
+  it('accepts a value sitting exactly on the cap', () => {
+    assert.equal(FulfillmentCard.safeParse({ ...valid, number: '4'.repeat(32) }).success, true);
+  });
+
+  it('reports the offending field so the message names the problem', () => {
+    const result = FulfillmentCard.safeParse({ ...valid, cvv: 'x'.repeat(9) });
+    assert.equal(result.error.issues[0].path[0], 'cvv');
+    assert.equal(result.error.issues[0].message, 'card.cvv is too long');
   });
 });
