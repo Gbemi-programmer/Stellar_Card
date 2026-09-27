@@ -216,24 +216,34 @@ const validateListOrders = validate({
   errorCodes: ListOrdersErrorCodes,
 });
 
+/**
+ * Factory for creating order creation rate limiters.
+ *
+ * @param {Partial<import('express-rate-limit').Options>} [overrideOptions]
+ */
+function createOrderCreateLimiter(overrideOptions = {}) {
+  return rateLimit({
+    windowMs: 60 * 60 * 1000,
+    limit: (req) => {
+      const rpm = req.apiKey?.rate_limit_rpm;
+      if (rpm && rpm > 0) return rpm * 60; // convert rpm → per-hour
+      return 60; // default 60/hour
+    },
+    keyGenerator: (req) => req.apiKey?.id || /** @type {any} */ (ipKeyGenerator)(req),
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    handler: (req, res) =>
+      res.status(429).json({
+        error: 'rate_limit_exceeded',
+        message: "Too many orders created. Check your key's rate_limit_rpm setting.",
+      }),
+    ...overrideOptions,
+  });
+}
+
 // Rate limit order creation per API key — default 60/hour, overridable per key via rate_limit_rpm.
 // req.apiKey is set by the auth middleware before this runs.
-const orderCreateLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  limit: (req) => {
-    const rpm = req.apiKey?.rate_limit_rpm;
-    if (rpm && rpm > 0) return rpm * 60; // convert rpm → per-hour
-    return 60; // default 60/hour
-  },
-  keyGenerator: (req) => req.apiKey?.id || /** @type {any} */ (ipKeyGenerator)(req),
-  standardHeaders: 'draft-7',
-  legacyHeaders: false,
-  handler: (req, res) =>
-    res.status(429).json({
-      error: 'rate_limit_exceeded',
-      message: "Too many orders created. Check your key's rate_limit_rpm setting.",
-    }),
-});
+const orderCreateLimiter = createOrderCreateLimiter();
 
 // Concurrent-stream tracking. Each open SSE connection on
 // /v1/orders/:id/stream or /dashboard/stream increments the relevant
@@ -1287,3 +1297,5 @@ module.exports.releaseStreamSlot = releaseStreamSlot;
 // a single limiter for "agent reads" means one noisy key can't steal
 // its own poll budget by spamming preview endpoints.
 module.exports.orderPollLimiter = orderPollLimiter;
+module.exports.orderCreateLimiter = orderCreateLimiter;
+module.exports.createOrderCreateLimiter = createOrderCreateLimiter;

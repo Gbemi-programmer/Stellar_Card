@@ -6,6 +6,8 @@ const crypto = require('crypto');
 const express = require('express');
 const helmet = require('helmet');
 const cors = require('cors');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
+const db = require('./db');
 const { log } = require('./lib/logger');
 const {
   sentryRequestHandler,
@@ -129,23 +131,10 @@ function _resetReqIdWarnState() {
   _reqIdWarnedIps.clear();
 }
 
-/** @type {any} */ const helmetMiddleware = helmet;
-// helmet defaults are fine for everything except the HSTS header — the
-// built-in default is max-age=15552000 (180 days) with no `preload`
-// directive, which is too short to qualify for the Chrome HSTS preload
-// list. Bump to two years + preload so api.stellar_card.com can be
-// submitted to hstspreload.org and every browser refuses plaintext
-// even on first visit. frameguard stays at SAMEORIGIN (API JSON
-// responses don't need to be embeddable anywhere).
-app.use(
-  helmetMiddleware({
-    hsts: {
-      maxAge: 63072000, // 2 years
-      includeSubDomains: true,
-      preload: true,
-    },
-  }),
-);
+const { securityHeaders } = require('./middleware/security');
+
+// Security headers middleware powered by Helmet (HSTS, Frameguard, etc.)
+app.use(securityHeaders);
 app.set('trust proxy', 1);
 
 // Audit A-25: require HTTPS in non-development environments. A misconfigured
@@ -648,6 +637,15 @@ app.get('/v1/usage', orderPollLimiter, (req, res) => {
   });
 });
 
+const adminLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 100,
+  keyGenerator: (/** @type {any} */ req) => ipKeyGenerator(req),
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  handler: (_, res) => res.status(429).json({ error: 'too_many_requests' }),
+});
+
 app.use('/auth', authRouter);
 // Platform-owner cross-tenant surface. Mounted BEFORE /dashboard so its
 // prefix catches /dashboard/platform/* before the tenant-scoped
@@ -689,6 +687,7 @@ app.use((err, req, res, next) => {
     return res.status(403).json({ error: 'forbidden', message: 'Origin not allowed' });
   }
   next(err);
+});
 // JSON 404 — mounted after every route so it only catches genuinely
 // unmatched paths. Without this Express falls back to its default HTML
 // error page, which is inconsistent with every other response this API
@@ -755,22 +754,6 @@ app.use((err, req, res, next) => {
 
   res.status(500).json({ error: 'internal_error' });
 });
-// Every route lives in its own module under api/, and routes/index.js owns
-// the mount table. Three of those mounts are order-sensitive (the
-// unauthenticated MPP and claim endpoints, and the pre-auth failure limiter)
-// and the reasoning is documented there rather than here, so the answer to
-// "which paths require an api key" lives in exactly one place.
-registerRoutes(app);
-
-// Issue #29: Sentry's error handler must be mounted after all routes but
-// before the app's own errorHandler, so it can capture the error and then
-// call next(err) to hand off to errorHandler for the actual response —
-// see the app.use(sentryRequestHandler()) comment above for why this was
-// previously dead code.
-app.use(sentryErrorHandler());
-
-// Standardized global error handler
-app.use(errorHandler);
 
 module.exports = app;
 // Test-only exports for the 2026-04-16 audit hardening. Not part of
