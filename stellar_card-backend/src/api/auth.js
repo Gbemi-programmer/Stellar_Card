@@ -15,14 +15,12 @@ const { Router } = require('express');
 const { z } = require('zod');
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
-const { z } = require('zod');
 const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const db = require('../db');
 const { sendLoginCode } = require('../lib/email');
 const { isPlatformOwner } = require('../lib/platform');
 const { recordAudit } = require('../lib/audit');
 const { validate, patternString } = require('../lib/validate');
-const { validateBody } = require('../middleware/validate');
 
 const router = Router();
 
@@ -129,14 +127,6 @@ function normalizeEmail(email) {
   return email.trim().toLowerCase();
 }
 
-// Issue #27: same shape/regex the manual check enforced (see the F1-auth
-// comment on the route below) — a string matching a plain
-// local-part@domain.tld pattern. Not RFC 5322 exhaustive by design; this is
-// a login-code destination, not a mailbox existence check.
-const loginBodySchema = z.object({
-  email: z.string().regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, 'A valid email address is required.'),
-});
-
 // Adversarial audit F2-auth (2026-04-15): coerce client IP to a
 // single string. `req.headers['x-forwarded-for']` is typed
 // `string | string[] | undefined` in Express — when a proxy sets
@@ -193,21 +183,15 @@ function extractBearerToken(req) {
 // Content-Type, an array body, or a null body used to crash the
 // destructure with "Cannot destructure property 'email' of 'undefined'"
 // and return 500 instead of a clear 400) as well as the address shape.
+//
+// The schema is declared once, next to the route, in the shared
+// validate() middleware (src/lib/validate.js) rather than as an inline
+// guard. Both forms reject a non-object body with `invalid_request` and
+// a bad address with `invalid_email`; validate() additionally keeps
+// unknown keys on the body (`.passthrough()`) so this route's contract
+// is unchanged, and reports the offending field rather than the whole
+// body.
 router.post('/login', loginLimiter, validateLogin, async (req, res) => {
-router.post(
-  '/login',
-  loginLimiter,
-  // Adversarial audit F1-auth (2026-04-15) / Issue #27: reject requests
-  // whose body isn't a plain JSON object upfront, and require `email` to
-  // match a valid-address shape. Without the body-shape guard, a request
-  // with no Content-Type, an array body, or a null body crashed the
-  // destructure `const { email } = req.body` with `Cannot destructure
-  // property 'email' of 'undefined'` — Express returned 500 instead of a
-  // clear 400. Same shape guard as the one added to POST /v1/orders in an
-  // earlier cycle, now expressed as a reusable Zod schema (see
-  // src/middleware/validate.js).
-  validateBody(loginBodySchema, { fieldErrorCode: 'invalid_email' }),
-  async (req, res) => {
   const { email } = req.body;
   const addr = normalizeEmail(email);
 

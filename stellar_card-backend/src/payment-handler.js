@@ -17,13 +17,24 @@
 
 const { v4: uuidv4 } = require('uuid');
 const db = require('./db');
-const { getInvoice, notifyPaid } = require('./vcc-client');
+// Module object, not destructured, for the same reason as xlmSender below:
+// destructuring captures the reference at load time, so a test cannot
+// substitute a getInvoice that throws and reach the outer catch — which
+// is the branch that decides whether an order gets marked failed and
+// refunded, and therefore the one most worth a direct test. vcc-client is
+// also the only collaborator here that talks to the network, so a stub
+// here is also what keeps the unit suite off Horizon.
+const vccClient = require('./vcc-client');
 // Import as module object so tests can monkey-patch xlmSender.payCtxOrder
 // at runtime. Destructuring captures the reference at load time and
 // prevents tests from exercising the ambiguous-outcome branch without
 // a full patchCache refactor. Same pattern applied in jobs.js.
 const xlmSender = require('./payments/xlm-sender');
-const { refundOrQuarantine } = require('./fulfillment');
+// Module object for the same reason: refundOrQuarantine is what proves the
+// outer catch actually scheduled a refund, and a destructured binding
+// would make that unobservable from a unit test — the stub would be
+// installed on an object the handler never reads.
+const fulfillment = require('./fulfillment');
 // Deferred logger reference so tests can monkey-patch `logger.event`
 // at runtime without having to patchCache before module load. Same
 // pattern used by src/middleware/requireCardReveal.js after the
@@ -369,7 +380,7 @@ async function handlePayment({
   }
 
   try {
-    const { vccJobId, paymentUrl, callbackNonce } = await getInvoice(
+    const { vccJobId, paymentUrl, callbackNonce } = await vccClient.getInvoice(
       orderId,
       order.amount_usdc,
       order.request_id,
@@ -475,7 +486,7 @@ async function handlePayment({
       `UPDATE orders SET xlm_sent_at = ?, ctx_stellar_txid = ?, updated_at = ? WHERE id = ?`,
     ).run(new Date().toISOString(), ctxTxHash || null, new Date().toISOString(), orderId);
 
-    await notifyPaid(vccJobId);
+    await vccClient.notifyPaid(vccJobId);
     db.prepare(`UPDATE orders SET vcc_notified_at = ?, updated_at = ? WHERE id = ?`).run(
       new Date().toISOString(),
       new Date().toISOString(),
@@ -503,9 +514,11 @@ async function handlePayment({
       new Date().toISOString(),
       orderId,
     );
-    refundOrQuarantine(orderId, safePublicMessage).catch((e) =>
-      console.error(`[payment] refund error for ${orderId.slice(0, 8)}: ${safeErrorMessage(e)}`),
-    );
+    fulfillment
+      .refundOrQuarantine(orderId, safePublicMessage)
+      .catch((e) =>
+        console.error(`[payment] refund error for ${orderId.slice(0, 8)}: ${safeErrorMessage(e)}`),
+      );
   }
 }
 
