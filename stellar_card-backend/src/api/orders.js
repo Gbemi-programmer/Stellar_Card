@@ -218,12 +218,25 @@ const validateListOrders = validate({
 
 // Rate limit order creation per API key — default 60/hour, overridable per key via rate_limit_rpm.
 // req.apiKey is set by the auth middleware before this runs.
+//
+// Part 5: the hourly default is env-overridable via
+// ORDER_CREATE_LIMIT_PER_HOUR so ops can tighten/loosen the ceiling
+// without a redeploy — and so tests can shrink it to single digits
+// instead of firing 61 requests to prove the 429 trip. Read live per
+// request (not captured at module load) so a config change applies
+// without a restart. Non-numeric / non-positive values fall back to
+// 60; a typo in an optional tuning variable must never disable the
+// limiter (fail closed) or clamp it to 1ms-style degenerate values.
+function defaultCreateLimitPerHour() {
+  const raw = parseInt(process.env.ORDER_CREATE_LIMIT_PER_HOUR || '60', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 60;
+}
 const orderCreateLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   limit: (req) => {
     const rpm = req.apiKey?.rate_limit_rpm;
     if (rpm && rpm > 0) return rpm * 60; // convert rpm → per-hour
-    return 60; // default 60/hour
+    return defaultCreateLimitPerHour();
   },
   keyGenerator: (req) => req.apiKey?.id || /** @type {any} */ (ipKeyGenerator)(req),
   standardHeaders: 'draft-7',
