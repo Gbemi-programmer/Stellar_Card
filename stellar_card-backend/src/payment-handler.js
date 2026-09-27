@@ -43,6 +43,48 @@ const fulfillment = require('./fulfillment');
 const logger = require('./lib/logger');
 const { publicMessage } = require('./lib/sanitize-error');
 
+// Test hooks (Part 4) — dependency injection for unit tests.
+//
+// getInvoice / notifyPaid / refundOrQuarantine used to be destructured
+// at module load, which captured the function references and made them
+// invisible to require.cache stubbing (the test file documents this
+// limitation on its F2 regression guard). xlmSender.payCtxOrder never
+// had this problem because it is invoked through the module object.
+// These setters follow the src/mpp/verify.js::_setRpcServer precedent:
+// unit tests inject stubs, exercise handlePayment in isolation (no fake
+// VCC HTTP server needed), and restore production implementations via
+// _resetTestHooks. Production call sites below always go through the
+// `let` bindings, never the module objects directly.
+let _getInvoice = vccClient.getInvoice;
+let _notifyPaid = vccClient.notifyPaid;
+let _refundOrQuarantine = fulfillment.refundOrQuarantine;
+
+/**
+ * Inject stub vcc-client functions for tests. Omitted keys keep their
+ * current binding. Not for production use.
+ * @param {{getInvoice?: Function, notifyPaid?: Function}} [stubs]
+ */
+function _setVccClient(stubs = {}) {
+  if (stubs.getInvoice !== undefined) _getInvoice = stubs.getInvoice;
+  if (stubs.notifyPaid !== undefined) _notifyPaid = stubs.notifyPaid;
+}
+
+/**
+ * Inject a stub fulfillment.refundOrQuarantine for tests. Omitted keys
+ * keep their current binding. Not for production use.
+ * @param {{refundOrQuarantine?: Function}} [stubs]
+ */
+function _setFulfillment(stubs = {}) {
+  if (stubs.refundOrQuarantine !== undefined) _refundOrQuarantine = stubs.refundOrQuarantine;
+}
+
+/** Restore the production vcc-client / fulfillment implementations. */
+function _resetTestHooks() {
+  _getInvoice = vccClient.getInvoice;
+  _notifyPaid = vccClient.notifyPaid;
+  _refundOrQuarantine = fulfillment.refundOrQuarantine;
+}
+
 /**
  * Compare two decimal-string amounts without losing precision.
  * Returns 1/-1/0 like a classic C comparator. Treats null/undefined as 0.
@@ -486,6 +528,7 @@ async function handlePayment({
       `UPDATE orders SET xlm_sent_at = ?, ctx_stellar_txid = ?, updated_at = ? WHERE id = ?`,
     ).run(new Date().toISOString(), ctxTxHash || null, new Date().toISOString(), orderId);
 
+    await _notifyPaid(vccJobId);
     await vccClient.notifyPaid(vccJobId);
     db.prepare(`UPDATE orders SET vcc_notified_at = ?, updated_at = ? WHERE id = ?`).run(
       new Date().toISOString(),
@@ -514,6 +557,9 @@ async function handlePayment({
       new Date().toISOString(),
       orderId,
     );
+    _refundOrQuarantine(orderId, safePublicMessage).catch((e) =>
+      console.error(`[payment] refund error for ${orderId.slice(0, 8)}: ${safeErrorMessage(e)}`),
+    );
     fulfillment
       .refundOrQuarantine(orderId, safePublicMessage)
       .catch((e) =>
@@ -527,4 +573,8 @@ module.exports = {
   // Test-only exports for the 2026-04-15 audit hardening.
   _parseStrictPositiveStroops: parseStrictPositiveStroops,
   _safeErrorMessage: safeErrorMessage,
+  // Test-only dependency-injection hooks (Part 4). See _setVccClient.
+  _setVccClient,
+  _setFulfillment,
+  _resetTestHooks,
 };

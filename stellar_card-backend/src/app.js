@@ -50,6 +50,8 @@ const {
   sentryErrorHandler,
   setRequestId: setSentryRequestId,
 } = require('./lib/sentry-config');
+const { captureException } = require('./lib/sentry-config');
+const { registerRoutes } = require('./routes');
 const { registerRoutes } = require('./routes');
 const corsDenial = require('./middleware/corsDenial');
 const notFound = require('./middleware/notFound');
@@ -270,6 +272,12 @@ app.use(
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 //
+// Every route lives in its own module under api/, and routes/index.js owns
+// the mount table. Three of those mounts are order-sensitive (the
+// unauthenticated MPP and claim endpoints, and the pre-auth failure limiter)
+// and the reasoning is documented there rather than here, so the answer to
+// "which paths require an api key" lives in exactly one place.
+registerRoutes(app);
 // Still wants a per-IP limiter so an attacker can't turn the public
 // /status endpoint into a cheap SQLite thrasher — the handler runs
 // six COUNT/SUM queries on every hit and is unauthenticated. 180/min
@@ -788,12 +796,6 @@ app.use((err, req, res, next) => {
 
   res.status(500).json({ error: 'internal_error' });
 });
-// Every route lives in its own module under api/, and routes/index.js owns
-// the mount table. Three of those mounts are order-sensitive (the
-// unauthenticated MPP and claim endpoints, and the pre-auth failure limiter)
-// and the reasoning is documented there rather than here, so the answer to
-// "which paths require an api key" lives in exactly one place.
-registerRoutes(app);
 
 // ── Terminal middleware ─────────────────────────────────────────────────
 //
