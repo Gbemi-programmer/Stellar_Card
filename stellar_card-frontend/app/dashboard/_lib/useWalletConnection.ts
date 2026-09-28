@@ -3,7 +3,7 @@
 
 'use client';
 
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useRef, useEffect, createContext, useContext } from 'react';
 import type { WalletConnectionState } from './walletConnection';
 import {
   getWalletStateLabel,
@@ -47,7 +47,17 @@ export interface UseWalletConnectionReturn {
   retry: () => void;
 }
 
-export function useWalletConnection(
+// Mock wallet contexts for sandbox testing
+export const MockWalletContext = createContext<UseWalletConnectionReturn | null>(null);
+
+// Sandbox context for testing different wallet states
+export const MockWalletSandboxContext = createContext<{
+  state: WalletConnectionState;
+  setState: (state: WalletConnectionState) => void;
+  reset: () => void;
+}> | null>(null);
+
+function useWalletConnectionStateImpl(
   options: UseWalletConnectionOptions = {},
 ): UseWalletConnectionReturn {
   const {
@@ -93,6 +103,7 @@ export function useWalletConnection(
       setPublicKey(key);
       setNetwork(net);
       setError(null);
+      setBalance({ xlm: '1000', usdc: '1000000' }); // Mock balances
       addToHistory({
         state: 'connecting',
         timestamp: Date.now(),
@@ -202,3 +213,49 @@ export function useWalletConnection(
     retry,
   };
 }
+
+export function useWalletConnection(
+  options: UseWalletConnectionOptions = {},
+): UseWalletConnectionReturn {
+  const mockContext = useContext(MockWalletContext);
+  const impl = useWalletConnectionStateImpl(options);
+  return mockContext ?? impl;
+}
+
+// Sandbox hook for testing - provides isolated wallet state control
+export function useWalletSandbox() {
+  const sandbox = useContext(MockWalletSandboxContext);
+  if (!sandbox) {
+    throw new Error('useWalletSandbox must be used within MockWalletSandboxProvider');
+  }
+  return sandbox;
+}
+
+// Provider for wallet sandbox testing
+const MockWalletSandboxProvider = ({
+  children,
+  initialState = 'disconnected',
+}: {
+  children: React.ReactNode;
+  initialState?: WalletConnectionState;
+}) => {
+  const [state, setState] = useState<WalletConnectionState>(initialState);
+
+  const setStateAction = useCallback((newState: WalletConnectionState) => {
+    setState(newState);
+  }, []);
+
+  const reset = useCallback(() => {
+    setState('disconnected');
+  }, []);
+
+  return (
+    <MockWalletSandboxContext.Provider value={{ state, setState, reset }}>
+      <MockWalletContext.Provider value={useWalletConnectionStateImpl({ initialState: state })}>
+        {children}
+      </MockWalletContext.Provider>
+    </MockWalletSandboxContext.Provider>
+  );
+};
+
+export { MockWalletSandboxProvider, useWalletSandbox };

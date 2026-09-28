@@ -136,6 +136,10 @@ export interface RetryOptions {
   baseDelayMs?: number;
   /** Max backoff cap in ms. */
   maxDelayMs?: number;
+  /** Jitter strategy used for retry delays. Defaults to full jitter. */
+  jitter?: 'full' | 'equal' | 'decorrelated' | 'none';
+  /** Optional callback invoked before waiting for each retry. */
+  onRetry?: (error: unknown, attempt: number, delayMs: number) => void;
 }
 
 export interface CreateOrderOptions extends OrderOptions, RequestOptions {
@@ -325,6 +329,8 @@ export class Stellar_CardClient {
       attempts: retry.attempts ?? 2,
       baseDelayMs: retry.baseDelayMs ?? 500,
       maxDelayMs: retry.maxDelayMs ?? 5000,
+      jitter: retry.jitter ?? 'full',
+      onRetry: retry.onRetry ?? (() => undefined),
     };
   }
 
@@ -348,6 +354,8 @@ export class Stellar_CardClient {
   ): Promise<Response> {
     const { attempts, baseDelayMs, maxDelayMs } = this.retry;
     const operation = `${init.method ?? 'GET'} ${url}`;
+  private async fetchWithRetry(url: string, init: RequestInit): Promise<Response> {
+    const { attempts, baseDelayMs, maxDelayMs, jitter, onRetry } = this.retry;
     let lastErr: unknown;
     for (let i = 0; i <= attempts; i++) {
       try {
@@ -363,9 +371,10 @@ export class Stellar_CardClient {
           baseDelayMs,
           maxDelayMs,
           retryAfter: res.headers?.get?.('Retry-After') ?? null,
-          jitter: 'full', // Use full jitter to avoid thundering herd
+          jitter,
           factor: 2, // Standard exponential backoff factor
         });
+        onRetry(lastErr, i, delayMs);
         await sleep(delayMs);
         continue;
       } catch (err) {
@@ -378,9 +387,10 @@ export class Stellar_CardClient {
           attempt: i,
           baseDelayMs,
           maxDelayMs,
-          jitter: 'full',
+          jitter,
           factor: 2,
         });
+        onRetry(err, i, delayMs);
         await sleep(delayMs);
       }
     }
@@ -455,6 +465,11 @@ export class Stellar_CardClient {
    *
    * Uses SSE first and falls back to HTTP polling if the stream cannot
    * be established or is interrupted by the network path.
+   *
+   * @param orderId - Order UUID to wait for.
+   * @param opts - Options for waiting including timeout and poll interval.
+   * @returns A promise resolving to the card details once ready.
+   * @throws {WaitTimeoutError} When the timeout is reached before the order is ready.
    */
   async waitForCard(
     orderId: string,

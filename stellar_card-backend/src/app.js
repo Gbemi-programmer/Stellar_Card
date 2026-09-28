@@ -1,6 +1,42 @@
 // @ts-check
 // Express application — importable without starting the Stellar watcher or jobs.
 // index.js is the entry point that wires everything up for production.
+//
+// This module owns ONE thing: the middleware chain that wraps every
+// request, in the order it must run. Everything that decides *which*
+// routes exist and in what order lives in src/routes/index.js. The split
+// is load-bearing and was the point of the earlier extraction:
+//
+//   src/app.js          — helmet, CORS, body parsing, request id, the
+//                         404 fallback, and the error handlers. Concerns
+//                         that apply to every request regardless of path.
+//   src/routes/index.js  — the mount table, including the order-sensitive
+//                         /v1 auth boundary.
+//
+// Issue #377 (Part 5). This file used to interleave three concerns:
+// application middleware, route mounting, and ~400 lines of inline
+// handler bodies for /status, /v1/agent/status, /v1/usage and
+// /v1/policy/check. Every one of those handlers had already been
+// extracted into src/api/ as a Router, but the inline copies were left
+// behind and mounted a second time. A bad merge (4d104a6) then spliced
+// the two worlds together and dropped a closing brace, leaving app.js
+// with a syntax error — which meant *every* test in the suite failed at
+// import, because test/helpers/app.js requires this file. Both problems
+// are fixed here:
+//
+//   1. The duplicated inline handlers are gone. The api/ modules are the
+//      single definition of those routes, so a fix to a rate limit or a
+//      status query can no longer be silently reverted by editing one
+//      copy and not the other.
+//   2. The CORS-denial shim, the JSON 404 and the legacy inline error
+//      handler are extracted into src/middleware/. They were three
+//      separate `app.use` blocks with overlapping responsibilities, one
+//      of which (the inline error handler) duplicated
+//      src/middleware/errorHandler.js and would have shadowed it.
+//
+// See the module headers of src/middleware/notFound.js,
+// src/middleware/corsDenial.js and src/middleware/errorHandler.js for
+// the behaviour each one owns.
 
 const crypto = require('crypto');
 const express = require('express');
@@ -9,20 +45,36 @@ const cors = require('cors');
 const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const db = require('./db');
 const { log } = require('./lib/logger');
-const auth = require('./middleware/auth');
-const ordersRouter = require('./api/orders');
-const { buildBudget, policyCheck, orderPollLimiter, openSSEStreamCount } = require('./api/orders');
-// Legacy /admin/* router was retired with the ampersand dashboard rewrite.
-// The new /dashboard surface (mounted below) is the canonical operator API
-// and is what /api/admin-proxy on the web app forwards to.
-const dashboardRouter = require('./api/dashboard');
-const authRouter = require('./api/auth');
-const internalRouter = require('./api/internal');
-const platformRouter = require('./api/platform');
-const vccCallbackRouter = require('./api/vcc-callback');
-const { MAX_WEBHOOK_ATTEMPTS: MAX_WEBHOOK_ATTEMPTS_FOR_STATUS } = require('./fulfillment');
+const {
+  sentryRequestHandler,
+  sentryErrorHandler,
+  setRequestId: setSentryRequestId,
+} = require('./lib/sentry-config');
+const { captureException } = require('./lib/sentry-config');
+const { registerRoutes } = require('./routes');
+const { registerRoutes } = require('./routes');
+const corsDenial = require('./middleware/corsDenial');
+const notFound = require('./middleware/notFound');
+const errorHandler = require('./middleware/errorHandler');
 
 const app = express();
+
+// Sentry's request handler must be the very first middleware: it opens
+// the per-request scope that every later captureException() attaches
+// itself to, and anything mounted above it reports without request
+// context. It is a pass-through no-op when SENTRY_DSN is unset, which is
+// the case in development and across the whole test suite.
+// Issue #29: src/lib/sentry-config.js was fully built (init, request/error
+// handler middleware, capture helpers) but never actually wired into the
+// app — initSentry() had no caller anywhere in src/, so error tracking was
+// silently a no-op in every environment, production included. The request
+// handler must be the very first middleware (per Sentry's own docs) so it
+// can attach its transaction/scope before anything else runs; the error
+// handler must run before (not instead of) the app's own errorHandler so
+// Sentry sees every error the same way that handler does. Both are no-ops
+// outside production (see sentryRequestHandler/sentryErrorHandler in
+// sentry-config.js), so this has no effect on dev/test behavior.
+app.use(sentryRequestHandler());
 
 // B-13: Attach a unique request ID to every request for log correlation.
 //
@@ -58,9 +110,17 @@ const app = express();
 const REQ_ID_SHAPE = /^[A-Za-z0-9._:-]{1,64}$/;
 const _reqIdWarnedIps = new Set();
 
+/**
+ * Accept a client-supplied X-Request-ID only if it matches REQ_ID_SHAPE.
+ *
+ * Node joins duplicate headers with ', ' by default for most header
+ * names, but defensively handle both string[] and string.
+ *
+ * @param {unknown} raw
+ * @returns {string | null} the accepted id, or null to fall back to a
+ *   server-generated one
+ */
 function validateRequestId(raw) {
-  // Node joins duplicate headers with ', ' by default for most header
-  // names, but defensively handle both string[] and string.
   if (Array.isArray(raw)) raw = raw[0];
   if (typeof raw !== 'string') return null;
   if (!REQ_ID_SHAPE.test(raw)) return null;
@@ -92,6 +152,10 @@ app.use((req, res, next) => {
   }
   req.id = validated || crypto.randomUUID();
   res.setHeader('X-Request-ID', req.id);
+  // Tag the Sentry scope with the same correlation id the structured
+  // logs carry, so an event in Sentry can be joined back to the log
+  // lines for the request that produced it. No-op when Sentry is off.
+  setSentryRequestId(req.id);
   log('info', 'request', { req_id: req.id, method: req.method, path: req.path });
   next();
 });
@@ -103,23 +167,10 @@ function _resetReqIdWarnState() {
   _reqIdWarnedIps.clear();
 }
 
-/** @type {any} */ const helmetMiddleware = helmet;
-// helmet defaults are fine for everything except the HSTS header — the
-// built-in default is max-age=15552000 (180 days) with no `preload`
-// directive, which is too short to qualify for the Chrome HSTS preload
-// list. Bump to two years + preload so api.stellar_card.com can be
-// submitted to hstspreload.org and every browser refuses plaintext
-// even on first visit. frameguard stays at SAMEORIGIN (API JSON
-// responses don't need to be embeddable anywhere).
-app.use(
-  helmetMiddleware({
-    hsts: {
-      maxAge: 63072000, // 2 years
-      includeSubDomains: true,
-      preload: true,
-    },
-  }),
-);
+const { securityHeaders } = require('./middleware/security');
+
+// Security headers middleware powered by Helmet (HSTS, Frameguard, etc.)
+app.use(securityHeaders);
 app.set('trust proxy', 1);
 
 // Audit A-25: require HTTPS in non-development environments. A misconfigured
@@ -219,244 +270,14 @@ app.use(
   }),
 );
 
-const adminLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 100,
-  keyGenerator: (/** @type {any} */ req) => ipKeyGenerator(req),
-  standardHeaders: 'draft-7',
-  legacyHeaders: false,
-  handler: (_, res) => res.status(429).json({ error: 'too_many_requests' }),
-});
-
-// Note: /auth/login and /auth/verify carry their own per-path rate
-// limiters in api/auth.js. We used to mount a blanket `authLimiter`
-// here covering every /auth/* endpoint at 10 req / 15 min / IP, but
-// that also gated /auth/me — the pure session-read the dashboard
-// layout calls on every hard refresh — and produced 429s for users
-// sharing a NAT'd network while doing nothing brute-forceable. The
-// limiters now live inside the auth router so only the mutating
-// endpoints (minting codes, verifying codes) get throttled.
-
-// Audit C-9: API version endpoint for deploy-time compatibility checks.
-const versionLimiter = rateLimit({
-  windowMs: 60000,
-  limit: 60,
-  standardHeaders: 'draft-7',
-  legacyHeaders: false,
-});
-app.get('/api/version', versionLimiter, (_req, res) => {
-  res.json({
-    service: 'stellar_card',
-    version: '0.1.0',
-    hmac_protocol: 'v3',
-    features: ['idempotency_key', 'soroban_contract', 'webhook_circuit_breaker', 'callback_nonce'],
-  });
-});
-
-// POST /v1/agent/claim — unauthenticated one-shot claim endpoint.
-// The agent posts a code minted by the dashboard; we return the real
-// api_key once, then mark the code used so it can never be redeemed
-// again. Heavily rate-limited by IP because this is the one endpoint
-// on /v1 that doesn't require an api key.
-const claimLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  limit: 10,
-  keyGenerator: (/** @type {any} */ req) => ipKeyGenerator(req),
-  standardHeaders: 'draft-7',
-  legacyHeaders: false,
-  handler: (_, res) =>
-    res.status(429).json({
-      error: 'too_many_requests',
-      message: 'Too many claim attempts. Wait a minute and try again.',
-    }),
-});
-app.post('/v1/agent/claim', claimLimiter, (req, res) => {
-  const { event: bizEvent } = require('./lib/logger');
-  const secretBox = require('./lib/secret-box');
-  const { hashClaimCode } = require('./lib/claim-hash');
-  const { recordAudit } = require('./lib/audit');
-  const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
-  if (!code) {
-    return res.status(400).json({ error: 'missing_code', message: 'code is required' });
-  }
-
-  // F1: the DB stores SHA256(code), not the code itself. Hash before
-  // lookup so the UNIQUE constraint still matches the mint path.
-  const codeHash = hashClaimCode(code);
-
-  // F2: fold the used_at mark and the sealed_payload wipe into a single
-  // atomic UPDATE. The previous flow was claim → SELECT → decrypt →
-  // separate UPDATE wipe, which meant a crash between mark-used and
-  // wipe left the sealed_payload in the DB alongside used_at=set. The
-  // wipe's stated intent ("DB dump after redemption can't re-extract
-  // the api_key") depended on that window being zero. The UPDATE
-  // below returns the pre-wipe sealed_payload via a nested SELECT so
-  // we still get the payload to decrypt in memory, but the row itself
-  // is mutated to the post-redemption state in one statement.
-  //
-  // Concurrent callers: better-sqlite3's transaction() wraps this in
-  // BEGIN IMMEDIATE, so the second caller blocks on the write lock
-  // until the first commits. After commit the second sees used_at set
-  // and UPDATE returns changes=0.
-  //
-  // F1-claim adversarial audit (2026-04-15): decrypt HAS to happen
-  // INSIDE the transaction. Previously the flow was:
-  //   mark used + wipe payload  (commits)
-  //   secretBox.open(payload)   (can throw)
-  // If open() threw — missing CARDS402_SECRET_BOX_KEY, corrupt blob,
-  // wrong key after rotation, whatever — the claim was already
-  // committed as used. The agent's next retry hit 401 invalid_claim
-  // and the claim was permanently burned by a transient server
-  // misconfiguration. Moving the decrypt inside the transaction
-  // means a throw rolls the whole txn back and the claim stays
-  // valid. better-sqlite3 transactions are fully sync so the
-  // synchronous crypto call slots in cleanly.
-  const now = new Date().toISOString();
-  const ip = /** @type {any} */ (req).ip || /** @type {any} */ (req).socket?.remoteAddress || null;
-
-  const redeemTx = db.transaction((codeHashArg) => {
-    const selectStmt = db.prepare(
-      `SELECT api_key_id, sealed_payload FROM agent_claims
-       WHERE code = ? AND used_at IS NULL AND datetime(expires_at) > datetime('now')`,
-    );
-    const rowArg = /** @type {any} */ (selectStmt.get(codeHashArg));
-    if (!rowArg) return null;
-    // Decrypt BEFORE marking used. Any throw here aborts the txn via
-    // better-sqlite3's sync rollback semantics so the claim remains
-    // valid for retry. Returning a structured error type lets the
-    // outer catch map it to a sanitised 500 without exposing internal
-    // crypto details to the client.
-    let payloadJson;
-    try {
-      payloadJson = JSON.parse(secretBox.open(rowArg.sealed_payload));
-    } catch (decryptErr) {
-      const wrapped = /** @type {Error & { claimDecryptFailed?: boolean }} */ (
-        new Error(`claim_decrypt_failed: ${/** @type {Error} */ (decryptErr).message}`)
-      );
-      wrapped.claimDecryptFailed = true;
-      throw wrapped;
-    }
-    const upd = db
-      .prepare(
-        `UPDATE agent_claims
-         SET used_at = @now, claimed_ip = @ip, sealed_payload = ''
-         WHERE code = @code AND used_at IS NULL`,
-      )
-      .run({ code: codeHashArg, now, ip });
-    if (upd.changes === 0) return null; // lost the race to another concurrent call
-    return { row: rowArg, payload: payloadJson };
-  });
-
-  /** @type {{ row: any, payload: any } | null} */
-  let redeemResult;
-  try {
-    redeemResult = redeemTx(codeHash);
-  } catch (err) {
-    // F1-claim: decrypt failure rolled the txn back. The claim is
-    // still valid. Log server-side with detail, return a generic
-    // 500 to the client. F2-claim adversarial audit: do NOT echo
-    // the env var name ("CARDS402_SECRET_BOX_KEY") back to an
-    // unauthenticated caller — that's an info leak.
-    if (/** @type {any} */ (err)?.claimDecryptFailed) {
-      console.error(
-        `[claim] decrypt failed (txn rolled back, claim still valid): ${err instanceof Error ? err.message : String(err)}`,
-      );
-      bizEvent('agent.claim_decrypt_failed', {
-        code_hash_prefix: codeHash.slice(0, 12),
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return res.status(500).json({
-        error: 'claim_decrypt_failed',
-        message: 'Failed to decrypt claim payload. Contact support if this persists.',
-      });
-    }
-    // Any other unexpected throw inside the txn — rethrow so Express
-    // emits a 500 via its default error handler. Shouldn't happen in
-    // practice; the only throw path inside the txn is the decrypt.
-    throw err;
-  }
-  if (!redeemResult) {
-    // invalid, expired, or already used — same generic 401 for all
-    // three buckets so probing can't distinguish them.
-    return res.status(401).json({
-      error: 'invalid_claim',
-      message: 'Claim code is invalid, expired, or already used.',
-    });
-  }
-  const row = redeemResult.row;
-  const payload = redeemResult.payload;
-
-  const key = /** @type {any} */ (
-    db.prepare(`SELECT id, label, dashboard_id FROM api_keys WHERE id = ?`).get(row.api_key_id)
-  );
-
-  // F3: write an audit_log row for the claim redemption. This is the
-  // single most forensically important event in the api-key lifecycle
-  // (who turned a mint into live credentials, from what IP, when) and
-  // was previously only in bizEvent telemetry — invisible to dashboard
-  // operators reviewing audit history. Scoped to the api_key's owning
-  // dashboard via the join above.
-  if (key?.dashboard_id) {
-    // F3-claim: coerce user-agent to a single string (same class of
-    // `string | string[]` type bug I fixed in api/auth.js — Express
-    // may hand an array through for duplicated headers).
-    const uaHeader = req.headers?.['user-agent'];
-    const userAgent = Array.isArray(uaHeader) ? uaHeader[0] || null : uaHeader || null;
-    recordAudit({
-      dashboardId: key.dashboard_id,
-      actor: { id: null, email: 'agent-claim', role: 'system' },
-      action: 'agent.claim_redeemed',
-      resourceType: 'agent',
-      resourceId: row.api_key_id,
-      details: { label: key.label ?? null },
-      ip,
-      userAgent,
-    });
-  }
-
-  // Flip the key into 'initializing' state the instant the claim is
-  // redeemed, so the dashboard's modal + state pill progress even if the
-  // agent's CLI hasn't yet gotten to its own reportStatus call (network
-  // lag, CLI crash between claim and wallet creation, etc.).
-  db.prepare(
-    `UPDATE api_keys
-     SET agent_state = 'initializing',
-         agent_state_at = @at,
-         agent_state_detail = 'claim redeemed'
-     WHERE id = @id`,
-  ).run({ id: row.api_key_id, at: now });
-
-  // Emit both a generic claim event (for audit) and the typed
-  // agent_state event (for the SSE subscribers filtering by type).
-  bizEvent('agent.claimed', {
-    api_key_id: row.api_key_id,
-    label: key?.label ?? null,
-    ip,
-  });
-  const { emit: emitBusEvent } = require('./lib/event-bus');
-  emitBusEvent('agent_state', {
-    api_key_id: row.api_key_id,
-    state: 'initializing',
-    wallet_public_key: null,
-    detail: 'claim redeemed',
-  });
-
-  res.json({
-    api_key: payload.api_key,
-    webhook_secret: payload.webhook_secret ?? null,
-    api_key_id: row.api_key_id,
-    label: key?.label ?? null,
-    api_url: process.env.PUBLIC_API_BASE_URL || 'https://api.stellar_card.com/v1',
-  });
-});
-
-// ── Public /status endpoint ───────────────────────────────────────────────────
+// ── Routes ────────────────────────────────────────────────────────────────────
 //
-// Powers both the dashboard banner and the public status page at
-// stellar_card.com/status (and status.stellar_card.com via the proxy rewrite).
-// Aims to be cheap enough to hit every 10–30s without load concerns:
-// all queries are indexed and bounded to time windows.
-//
+// Every route lives in its own module under api/, and routes/index.js owns
+// the mount table. Three of those mounts are order-sensitive (the
+// unauthenticated MPP and claim endpoints, and the pre-auth failure limiter)
+// and the reasoning is documented there rather than here, so the answer to
+// "which paths require an api key" lives in exactly one place.
+registerRoutes(app);
 // Still wants a per-IP limiter so an attacker can't turn the public
 // /status endpoint into a cheap SQLite thrasher — the handler runs
 // six COUNT/SUM queries on every hit and is unauthenticated. 180/min
@@ -858,6 +679,15 @@ app.get('/v1/usage', orderPollLimiter, (req, res) => {
   });
 });
 
+const adminLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 100,
+  keyGenerator: (/** @type {any} */ req) => ipKeyGenerator(req),
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  handler: (_, res) => res.status(429).json({ error: 'too_many_requests' }),
+});
+
 app.use('/auth', authRouter);
 // Platform-owner cross-tenant surface. Mounted BEFORE /dashboard so its
 // prefix catches /dashboard/platform/* before the tenant-scoped
@@ -891,14 +721,111 @@ const vccCallbackLimiter = rateLimit({
 });
 app.use('/vcc-callback', vccCallbackLimiter, vccCallbackRouter);
 
-// Structured CORS denial — cors() throws on rejected origins; catch and return clean 403
-app.use((err, req, res, _next) => {
+// Structured CORS denial — cors() throws on rejected origins; catch and return clean 403.
+// Non-CORS errors are forwarded to the next error handler (sentryErrorHandler then errorHandler)
+// so they are reported and responded to by the proper chain.
+app.use((err, req, res, next) => {
   if (err.message && err.message.startsWith('CORS:')) {
     return res.status(403).json({ error: 'forbidden', message: 'Origin not allowed' });
   }
+  next(err);
+});
+// JSON 404 — mounted after every route so it only catches genuinely
+// unmatched paths. Without this Express falls back to its default HTML
+// error page, which is inconsistent with every other response this API
+// returns and unparsable by an SDK expecting JSON.
+app.use((req, res) => {
+  res.status(404).json({ error: 'not_found', message: `No route for ${req.method} ${req.path}` });
+});
+
+// Centralized error handler.
+//
+// F1-app-error (Part 2 of the error-handling refactor): the previous
+// version had three real gaps:
+//
+//   1. No res.headersSent guard. SSE routes (GET /v1/orders/:id/stream)
+//      write headers immediately and stream over time; an error thrown
+//      after that point hit res.status().json() below, which throws
+//      ERR_HTTP_HEADERS_SENT instead of just closing the response.
+//      Express's documented contract for the final error handler is to
+//      delegate to the built-in default handler via next(err) once
+//      headers are already sent.
+//
+//   2. Every error collapsed to 500. express.json()'s body parser
+//      throws a SyntaxError with `.status = 400` for malformed JSON and
+//      a PayloadTooLargeError with `.status = 413` for bodies over the
+//      64kb cap (see the express.json() call above) — both were
+//      reported to the client as a generic 500 internal_error, which
+//      misrepresents a client mistake as a server failure.
+//
+//   3. No correlation with req.id and no Sentry reporting. Every other
+//      log line in this file goes through lib/logger so it carries
+//      req_id and (in production) reaches Sentry — this handler was the
+//      one place that only wrote to console.error, so unhandled 500s
+//      never reached Sentry and couldn't be joined to the rest of a
+//      request's log trail via req_id.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+
+  if (err.message && err.message.startsWith('CORS:')) {
+    return res.status(403).json({ error: 'forbidden', message: 'Origin not allowed' });
+  }
+
+  // Only trust an explicit 4xx as a genuine client error — that's the
+  // range well-understood upstream middleware (body-parser) uses.
+  // Anything outside it still falls through to the generic 500 below.
+  const status = Number(err.status || err.statusCode);
+  if (status >= 400 && status < 500) {
+    return res.status(status).json({
+      error: err.type || 'bad_request',
+      message: err.message || 'The request could not be processed.',
+    });
+  }
+
   console.error('[app] unhandled error:', err.message);
+  log('error', 'unhandled_error', {
+    req_id: req.id,
+    method: req.method,
+    path: req.path,
+    error: err instanceof Error ? err.message : String(err),
+  });
+  captureException(err, {
+    tags: { req_id: req.id },
+    extra: { path: req.path, method: req.method },
+  });
+
   res.status(500).json({ error: 'internal_error' });
 });
+
+// ── Terminal middleware ─────────────────────────────────────────────────
+//
+// Order below is Express's error-handling contract, not preference:
+//
+//   corsDenial   — converts the Error that cors() throws on a rejected
+//                  origin into a structured 403. It is an error handler
+//                  (4 args) so it only runs on the error path.
+//   notFound     — plain (2 arg) middleware, so it only runs when no
+//                  route matched. It must be registered AFTER every
+//                  route, which is why it sits below registerRoutes.
+//   sentryError  — reports, then forwards via next(err).
+//   errorHandler — the last responder; formats the client response.
+//
+// corsDenial has to come before sentryError because a CORS rejection is
+// a client-configuration error, not a server fault: reporting it to
+// Sentry would page on-call for a browser sending a disallowed Origin.
+
+app.use(corsDenial);
+app.use(notFound);
+
+// Issue #29: Sentry's error handler must be mounted after all routes but
+// before the app's own errorHandler, so it can capture the error and then
+// call next(err) to hand off to errorHandler for the actual response —
+// see the app.use(sentryRequestHandler()) comment above for why this was
+// previously dead code.
+app.use(sentryErrorHandler());
+
+// Standardized global error handler
+app.use(errorHandler);
 
 module.exports = app;
 // Test-only exports for the 2026-04-16 audit hardening. Not part of
