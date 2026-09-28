@@ -323,3 +323,10 @@ export function resolveCredentials(
 
   return { apiKey, baseUrl };
 }
+
+export {
+  clientOptionsSchema,
+  createOrderSchema,
+  validateClientOptions,
+  validateCreateOrderInput,
+} from './validation';
